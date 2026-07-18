@@ -2,11 +2,14 @@
 DX2 ComfyUI S3 Tools - nodes.py
 
 Provides:
-    DX2UploadVideoToS3 - uploads a generated video file to an
-    S3-compatible bucket.
+    DX2UploadVideoToS3
 
-The node accepts a file path either as a plain STRING or directly from the
-VHS_FILENAMES output of ComfyUI-VideoHelperSuite's VHS_VideoCombine node.
+Uploads a generated video file to an S3-compatible bucket.
+
+The source video may be provided as:
+
+1. A plain local filesystem path
+2. A VHS_FILENAMES output from ComfyUI-VideoHelperSuite
 
 Required environment variables:
     S3_BUCKET
@@ -22,9 +25,9 @@ import json
 import logging
 import mimetypes
 import os
+import re
 from datetime import datetime, timezone
-from pathlib import Path
-from uuid import uuid4
+from pathlib import Path, PurePosixPath
 
 import boto3
 from boto3.exceptions import S3UploadFailedError
@@ -48,18 +51,20 @@ class DX2UploadVideoToS3:
                         "multiline": False,
                     },
                 ),
-                "vhs_filenames": ("VHS_FILENAMES",),
-                "job_id": (
-                    "STRING",
-                    {
-                        "default": "",
-                        "multiline": False,
-                    },
+                "vhs_filenames": (
+                    "VHS_FILENAMES",
                 ),
-                "s3_key_prefix": (
+                "s3_path": (
                     "STRING",
                     {
                         "default": "videos",
+                        "multiline": False,
+                    },
+                ),
+                "file_name": (
+                    "STRING",
+                    {
+                        "default": "",
                         "multiline": False,
                     },
                 ),
@@ -82,34 +87,40 @@ class DX2UploadVideoToS3:
         self,
         local_path: str = "",
         vhs_filenames=None,
-        job_id: str = "",
-        s3_key_prefix: str = "videos",
+        s3_path: str = "videos",
+        file_name: str = "",
         enabled: bool = True,
     ):
         """
         Upload a video to S3 and return upload metadata as JSON.
 
-        The generated S3 key is collision-safe.
+        Destination examples:
 
-        With a job ID:
-            {prefix}/{YYYY}/{MM}/{DD}/{job_id}/{uuid}/{filename}
+            s3_path = "videos/tests"
+            file_name = "aura-test"
 
-        Without a job ID:
-            {prefix}/{YYYY}/{MM}/{DD}/{uuid}/{filename}
+            videos/tests/aura-test_<timestamp>.mp4
+
+        When file_name is empty:
+
+            videos/tests/<timestamp>.mp4
+
+        When s3_path is empty:
+
+            videos/<filename>_<timestamp>.mp4
         """
         if not enabled:
-            upload_info = {
-                "uploaded": False,
-                "status": "upload_skipped",
-            }
-
-            logger.info(
-                "DX2UploadVideoToS3: upload disabled, skipping."
+            return (
+                json.dumps(
+                    {
+                        "uploaded": False,
+                        "status": "upload_skipped",
+                    },
+                    separators=(",", ":"),
+                ),
             )
 
-            return (json.dumps(upload_info),)
-
-        resolved_path = self._resolve_path(
+        resolved_path = self._resolve_local_path(
             local_path=local_path,
             vhs_filenames=vhs_filenames,
         )
@@ -162,33 +173,22 @@ class DX2UploadVideoToS3:
                 "AWS_SECRET_ACCESS_KEY must both be set."
             )
 
-        filename = Path(resolved_path).name
-        date_path = datetime.now(
+        timestamp = datetime.now(
             timezone.utc
-        ).strftime("%Y/%m/%d")
-        unique_id = str(uuid4())
+        ).strftime("%Y%m%dT%H%M%S_%fZ")
 
-        parts = [
-            s3_key_prefix.strip("/"),
-            date_path,
-        ]
-
-        normalized_job_id = job_id.strip().strip("/")
-
-        if normalized_job_id:
-            parts.append(normalized_job_id)
-
-        parts.extend(
-            [
-                unique_id,
-                filename,
-            ]
+        normalized_s3_path = self._normalize_s3_path(
+            s3_path
         )
 
-        s3_key = "/".join(
-            part
-            for part in parts
-            if part
+        destination_filename = self._build_destination_filename(
+            source_path=resolved_path,
+            requested_name=file_name,
+            timestamp=timestamp,
+        )
+
+        s3_key = (
+            f"{normalized_s3_path}/{destination_filename}"
         )
 
         logger.info(
@@ -211,6 +211,7 @@ class DX2UploadVideoToS3:
             local_path=resolved_path,
             bucket=bucket,
             s3_key=s3_key,
+            destination_filename=destination_filename,
         )
 
         upload_info = {
@@ -218,8 +219,11 @@ class DX2UploadVideoToS3:
             "bucket": bucket,
             "key": s3_key,
             "uri": f"s3://{bucket}/{s3_key}",
-            "filename": filename,
+            "s3_path": normalized_s3_path,
+            "filename": destination_filename,
+            "source_filename": Path(resolved_path).name,
             "size_bytes": os.path.getsize(resolved_path),
+            "timestamp": timestamp,
         }
 
         logger.info(
@@ -235,16 +239,17 @@ class DX2UploadVideoToS3:
         )
 
     @staticmethod
-    def _resolve_path(
+    def _resolve_local_path(
         local_path: str,
         vhs_filenames,
     ) -> str:
         """
-        Resolve the video file path.
+        Resolve the source video file.
 
         Priority:
-            1. Explicit local_path
-            2. Last path from VHS_FILENAMES
+
+        1. Explicit local_path
+        2. Last file from VHS_FILENAMES
         """
         if local_path and local_path.strip():
             return local_path.strip()
@@ -254,8 +259,8 @@ class DX2UploadVideoToS3:
                 _, filepaths = vhs_filenames
             except (TypeError, ValueError) as exc:
                 raise ValueError(
-                    "DX2UploadVideoToS3: invalid VHS_FILENAMES payload. "
-                    "Expected a two-item tuple containing "
+                    "DX2UploadVideoToS3: invalid VHS_FILENAMES "
+                    "payload. Expected "
                     "(save_output, filepaths)."
                 ) from exc
 
@@ -263,9 +268,81 @@ class DX2UploadVideoToS3:
                 return str(filepaths[-1])
 
         raise ValueError(
-            "DX2UploadVideoToS3: no file path provided. "
+            "DX2UploadVideoToS3: no source video was provided. "
             "Connect local_path or vhs_filenames."
         )
+
+    @staticmethod
+    def _normalize_s3_path(
+        s3_path: str,
+    ) -> str:
+        """
+        Normalize the destination path.
+
+        Empty paths fall back to 'videos'.
+        Parent-directory components are removed.
+        """
+        raw_path = (s3_path or "").strip().strip("/")
+
+        if not raw_path:
+            return "videos"
+
+        parts = [
+            part
+            for part in PurePosixPath(raw_path).parts
+            if part not in ("", ".", "..", "/")
+        ]
+
+        normalized_path = "/".join(parts)
+
+        return normalized_path or "videos"
+
+    @staticmethod
+    def _build_destination_filename(
+        source_path: str,
+        requested_name: str,
+        timestamp: str,
+    ) -> str:
+        """
+        Build a readable, collision-resistant destination filename.
+
+        Examples:
+
+            aura-test_20260718T153012_482193Z.mp4
+            20260718T153012_482193Z.mp4
+        """
+        source_suffix = Path(source_path).suffix.lower()
+
+        if not source_suffix:
+            source_suffix = ".mp4"
+
+        requested_name = (requested_name or "").strip()
+
+        if not requested_name:
+            return f"{timestamp}{source_suffix}"
+
+        requested_filename = Path(requested_name).name
+        requested_path = Path(requested_filename)
+
+        requested_suffix = requested_path.suffix.lower()
+        suffix = requested_suffix or source_suffix
+
+        stem = (
+            requested_path.stem
+            if requested_suffix
+            else requested_filename
+        )
+
+        safe_stem = re.sub(
+            r"[^A-Za-z0-9._-]+",
+            "-",
+            stem,
+        ).strip("._-")
+
+        if not safe_stem:
+            return f"{timestamp}{suffix}"
+
+        return f"{safe_stem}-{timestamp}{suffix}"
 
     @staticmethod
     def _build_s3_client(
@@ -295,8 +372,9 @@ class DX2UploadVideoToS3:
         local_path: str,
         bucket: str,
         s3_key: str,
+        destination_filename: str,
     ) -> None:
-        """Upload the video file and preserve its MIME type."""
+        """Upload the source file and preserve its MIME type."""
         content_type, _ = mimetypes.guess_type(
             local_path
         )
@@ -311,7 +389,9 @@ class DX2UploadVideoToS3:
                         content_type
                         or "application/octet-stream"
                     ),
-                    "ContentDisposition": "inline",
+                    "ContentDisposition": (
+                        f'inline; filename="{destination_filename}"'
+                    ),
                 },
             )
         except (
