@@ -66,6 +66,12 @@ class TestUploadVideo(unittest.TestCase):
         result = self._node().upload_video(enabled=False)
         self.assertEqual(result, ("upload_skipped",))
 
+    def test_disabled_does_not_serialize_native_video(self):
+        video = MagicMock()
+        result = self._node().upload_video(video=video, enabled=False)
+        self.assertEqual(result, ("upload_skipped",))
+        video.save_to.assert_not_called()
+
     # ------------------------------------------------------------------
     # missing path
     # ------------------------------------------------------------------
@@ -159,6 +165,100 @@ class TestUploadVideo(unittest.TestCase):
             local_path="/tmp/explicit.mp4", vhs_filenames=vhs
         )
         self.assertEqual(result, ("s3://test-bucket/videos/explicit.mp4",))
+
+    # ------------------------------------------------------------------
+    # Native VIDEO input
+    # ------------------------------------------------------------------
+
+    def test_input_types_exposes_optional_native_video(self):
+        self.assertEqual(
+            DX2UploadVideoToS3.INPUT_TYPES()["optional"]["video"],
+            ("VIDEO",),
+        )
+
+    def test_native_video_is_serialized_uploaded_and_cleaned_up(self):
+        video = MagicMock()
+
+        def write_video(path):
+            with open(path, "wb") as output:
+                output.write(b"native-video")
+
+        video.save_to.side_effect = write_video
+
+        with patch.dict(os.environ, self.BASE_ENV):
+            with patch("boto3.client") as mock_boto:
+                mock_s3 = MagicMock()
+                mock_boto.return_value = mock_s3
+                result = self._node().upload_video(video=video)
+
+        temporary_path = video.save_to.call_args.args[0]
+        self.assertTrue(temporary_path.endswith(".mp4"))
+        mock_s3.upload_file.assert_called_once_with(
+            temporary_path,
+            "test-bucket",
+            f"videos/{os.path.basename(temporary_path)}",
+        )
+        self.assertEqual(
+            result,
+            (f"s3://test-bucket/videos/{os.path.basename(temporary_path)}",),
+        )
+        self.assertFalse(os.path.exists(temporary_path))
+
+    def test_native_video_takes_priority_over_other_sources(self):
+        video = MagicMock()
+
+        def write_video(path):
+            with open(path, "wb") as output:
+                output.write(b"native-video")
+
+        video.save_to.side_effect = write_video
+        vhs = (True, ["/tmp/vhs.mp4"])
+
+        with patch.dict(os.environ, self.BASE_ENV):
+            with patch("boto3.client") as mock_boto:
+                mock_s3 = MagicMock()
+                mock_boto.return_value = mock_s3
+                self._node().upload_video(
+                    video=video,
+                    local_path="/tmp/explicit.mp4",
+                    vhs_filenames=vhs,
+                )
+
+        uploaded_path = mock_s3.upload_file.call_args.args[0]
+        self.assertEqual(uploaded_path, video.save_to.call_args.args[0])
+        self.assertNotEqual(uploaded_path, "/tmp/explicit.mp4")
+
+    def test_native_video_temp_file_is_cleaned_up_when_upload_fails(self):
+        video = MagicMock()
+
+        def write_video(path):
+            with open(path, "wb") as output:
+                output.write(b"native-video")
+
+        video.save_to.side_effect = write_video
+        error = S3UploadFailedError("Connection reset")
+
+        with patch.dict(os.environ, self.BASE_ENV):
+            with patch("boto3.client") as mock_boto:
+                mock_s3 = MagicMock()
+                mock_s3.upload_file.side_effect = error
+                mock_boto.return_value = mock_s3
+                with self.assertRaises(RuntimeError):
+                    self._node().upload_video(video=video)
+
+        temporary_path = video.save_to.call_args.args[0]
+        self.assertFalse(os.path.exists(temporary_path))
+
+    def test_native_video_temp_file_is_cleaned_up_when_serialization_fails(self):
+        video = MagicMock()
+        video.save_to.side_effect = RuntimeError("encode failed")
+
+        with patch.dict(os.environ, self.BASE_ENV):
+            with self.assertRaisesRegex(RuntimeError, "encode failed"):
+                self._node().upload_video(video=video)
+
+        temporary_path = video.save_to.call_args.args[0]
+        self.assertFalse(os.path.exists(temporary_path))
 
     # ------------------------------------------------------------------
     # upload failures — P2: both ClientError and S3UploadFailedError
