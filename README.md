@@ -16,14 +16,16 @@ your workflow.
 
 | Name | Type | Required | Description |
 |---|---|---|---|
+| `video` | VIDEO | ✗ | Native video output from ComfyUI's built-in `CreateVideo` node. |
 | `local_path` | STRING | ✗ | Explicit filesystem path to the video file. |
 | `vhs_filenames` | VHS_FILENAMES | ✗ | Output of `VHS_VideoCombine` from ComfyUI-VideoHelperSuite. The last file in the list is used. |
 | `job_id` | STRING | ✗ | Optional job/run ID inserted into the S3 key: `{prefix}/{job_id}/{filename}`. |
 | `s3_key_prefix` | STRING | ✗ | Leading path for the S3 key (default: `videos`). |
 | `enabled` | BOOLEAN | ✗ | Set to `false` to skip upload and return `"upload_skipped"` (default: `true`). |
 
-At least one of `local_path` or `vhs_filenames` must be connected.
-When both are provided, `local_path` takes priority.
+At least one of `video`, `local_path`, or `vhs_filenames` must be connected.
+When multiple sources are provided, priority is `video`, then `local_path`, then
+`vhs_filenames`.
 
 #### Output
 
@@ -70,6 +72,18 @@ export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
 ---
 
 ## Wiring examples
+
+### With native CreateVideo (recommended)
+
+```
+CreateVideo ─┬─→ SaveVideo
+            └─→ video ─→ DX2UploadVideoToS3
+```
+
+Connect the native `VIDEO` output of ComfyUI's built-in `CreateVideo` node
+directly to the uploader. The uploader writes a temporary MP4 for transfer and
+removes it afterward, whether the upload succeeds or fails. VideoHelperSuite is
+not required for this workflow.
 
 ### With VHS_VideoCombine
 
