@@ -19,8 +19,8 @@ your workflow.
 | `video` | VIDEO | ✗ | Native video output from ComfyUI's built-in `CreateVideo` node. |
 | `local_path` | STRING | ✗ | Explicit filesystem path to the video file. |
 | `vhs_filenames` | VHS_FILENAMES | ✗ | Output of `VHS_VideoCombine` from ComfyUI-VideoHelperSuite. The last file in the list is used. |
-| `job_id` | STRING | ✗ | Optional job/run ID inserted into the S3 key: `{prefix}/{job_id}/{filename}`. |
-| `s3_key_prefix` | STRING | ✗ | Leading path for the S3 key (default: `videos`). |
+| `s3_path` | STRING | ✗ | Destination folder within the bucket (default: `videos`). |
+| `file_name` | STRING | ✗ | Optional filename stem. A UTC timestamp is appended to prevent collisions. |
 | `enabled` | BOOLEAN | ✗ | Set to `false` to skip upload and return `"upload_skipped"` (default: `true`). |
 
 At least one of `video`, `local_path`, or `vhs_filenames` must be connected.
@@ -31,7 +31,7 @@ When multiple sources are provided, priority is `video`, then `local_path`, then
 
 | Name | Type | Description |
 |---|---|---|
-| `upload_info` | STRING | S3 URI of the uploaded file, e.g. `s3://my-bucket/videos/job-1/output.mp4`. Returns `"upload_skipped"` when disabled. |
+| `upload_info` | STRING | S3 URI of the uploaded file, e.g. `s3://my-bucket/videos/minimax-h3/test-20260816T193012_123456Z.mp4`. Returns `"upload_skipped"` when disabled. |
 
 ---
 
@@ -83,7 +83,8 @@ CreateVideo ─┬─→ SaveVideo
 Connect the native `VIDEO` output of ComfyUI's built-in `CreateVideo` node
 directly to the uploader. The uploader writes a temporary MP4 for transfer and
 removes it afterward, whether the upload succeeds or fails. VideoHelperSuite is
-not required for this workflow.
+not required for this workflow. The temporary filename is never used in the S3
+key; `s3_path` and `file_name` control the destination just as they do for VHS.
 
 ### With VHS_VideoCombine
 

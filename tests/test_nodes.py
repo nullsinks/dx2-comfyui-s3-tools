@@ -45,6 +45,45 @@ class TestResolvePath(unittest.TestCase):
             DX2UploadVideoToS3._resolve_path("", "not-a-tuple")
 
 
+class TestS3Naming(unittest.TestCase):
+    """Tests for destination path and filename construction."""
+
+    TIMESTAMP = "20260816T193012_123456Z"
+
+    def test_normalizes_s3_path(self):
+        result = DX2UploadVideoToS3._normalize_s3_path(
+            " /videos//minimax-h3/ "
+        )
+        self.assertEqual(result, "videos/minimax-h3")
+
+    def test_empty_s3_path_defaults_to_videos(self):
+        self.assertEqual(DX2UploadVideoToS3._normalize_s3_path(""), "videos")
+
+    def test_builds_user_provided_mp4_filename(self):
+        result = DX2UploadVideoToS3._build_destination_filename(
+            source_path="/tmp/random-native-name.mp4",
+            requested_name="test",
+            timestamp=self.TIMESTAMP,
+        )
+        self.assertEqual(result, f"test-{self.TIMESTAMP}.mp4")
+
+    def test_requested_extension_overrides_source_extension(self):
+        result = DX2UploadVideoToS3._build_destination_filename(
+            source_path="/tmp/video.mp4",
+            requested_name="final.WEBM",
+            timestamp=self.TIMESTAMP,
+        )
+        self.assertEqual(result, f"final-{self.TIMESTAMP}.webm")
+
+    def test_missing_file_name_uses_timestamp_not_source_basename(self):
+        result = DX2UploadVideoToS3._build_destination_filename(
+            source_path="/tmp/random-native-name.mp4",
+            requested_name="",
+            timestamp=self.TIMESTAMP,
+        )
+        self.assertEqual(result, f"{self.TIMESTAMP}.mp4")
+
+
 class TestUploadVideo(unittest.TestCase):
     """Integration-style tests for DX2UploadVideoToS3.upload_video."""
 
@@ -54,6 +93,7 @@ class TestUploadVideo(unittest.TestCase):
         "AWS_SECRET_ACCESS_KEY": "test-secret",
         "S3_ENDPOINT_URL": "https://s3.example.com",
     }
+    FIXED_TIMESTAMP = "20260816T193012_123456Z"
 
     def _node(self):
         return DX2UploadVideoToS3()
@@ -115,7 +155,12 @@ class TestUploadVideo(unittest.TestCase):
     def _run_successful_upload(self, **kwargs):
         with patch.dict(os.environ, self.BASE_ENV):
             with patch("os.path.isfile", return_value=True):
-                with patch("boto3.client") as mock_boto:
+                with patch("nodes.datetime") as mock_datetime, patch(
+                    "boto3.client"
+                ) as mock_boto:
+                    mock_datetime.now.return_value.strftime.return_value = (
+                        self.FIXED_TIMESTAMP
+                    )
                     mock_s3 = MagicMock()
                     mock_boto.return_value = mock_s3
                     result = self._node().upload_video(**kwargs)
@@ -123,26 +168,44 @@ class TestUploadVideo(unittest.TestCase):
 
     def test_successful_upload_returns_s3_uri(self):
         result, _ = self._run_successful_upload(local_path="/tmp/video.mp4")
-        self.assertEqual(result, ("s3://test-bucket/videos/video.mp4",))
-
-    def test_s3_key_includes_job_id(self):
-        result, _ = self._run_successful_upload(
-            local_path="/tmp/video.mp4", job_id="job-123"
+        self.assertEqual(
+            result,
+            (f"s3://test-bucket/videos/{self.FIXED_TIMESTAMP}.mp4",),
         )
-        self.assertEqual(result, ("s3://test-bucket/videos/job-123/video.mp4",))
 
-    def test_custom_key_prefix(self):
+    def test_s3_key_uses_user_path_and_file_name(self):
         result, _ = self._run_successful_upload(
-            local_path="/tmp/video.mp4", s3_key_prefix="outputs/videos"
+            local_path="/tmp/video.mp4",
+            s3_path="videos/minimax-h3",
+            file_name="test",
         )
-        self.assertEqual(result, ("s3://test-bucket/outputs/videos/video.mp4",))
+        self.assertEqual(
+            result,
+            (
+                "s3://test-bucket/videos/minimax-h3/"
+                f"test-{self.FIXED_TIMESTAMP}.mp4"
+            ),
+        )
+
+    def test_custom_s3_path_is_normalized(self):
+        result, _ = self._run_successful_upload(
+            local_path="/tmp/video.mp4", s3_path="/outputs/videos/"
+        )
+        self.assertEqual(
+            result,
+            (f"s3://test-bucket/outputs/videos/{self.FIXED_TIMESTAMP}.mp4",),
+        )
 
     def test_upload_file_called_with_correct_args(self):
         _, mock_s3 = self._run_successful_upload(
-            local_path="/tmp/my.mp4", job_id="run-1"
+            local_path="/tmp/my.mp4",
+            s3_path="videos/wan2.2",
+            file_name="test",
         )
         mock_s3.upload_file.assert_called_once_with(
-            "/tmp/my.mp4", "test-bucket", "videos/run-1/my.mp4"
+            "/tmp/my.mp4",
+            "test-bucket",
+            f"videos/wan2.2/test-{self.FIXED_TIMESTAMP}.mp4",
         )
 
     # ------------------------------------------------------------------
@@ -151,30 +214,44 @@ class TestUploadVideo(unittest.TestCase):
 
     def test_accepts_vhs_filenames(self):
         vhs = (True, ["/tmp/out_00001.mp4"])
-        result, _ = self._run_successful_upload(vhs_filenames=vhs)
-        self.assertEqual(result, ("s3://test-bucket/videos/out_00001.mp4",))
+        result, _ = self._run_successful_upload(
+            vhs_filenames=vhs,
+            s3_path="videos/wan2.2",
+            file_name="test",
+        )
+        self.assertEqual(
+            result,
+            (
+                "s3://test-bucket/videos/wan2.2/"
+                f"test-{self.FIXED_TIMESTAMP}.mp4"
+            ),
+        )
 
     def test_vhs_filenames_uses_last_file(self):
         vhs = (True, ["/tmp/first.mp4", "/tmp/last.mp4"])
-        result, _ = self._run_successful_upload(vhs_filenames=vhs)
-        self.assertEqual(result, ("s3://test-bucket/videos/last.mp4",))
+        _, mock_s3 = self._run_successful_upload(vhs_filenames=vhs)
+        self.assertEqual(mock_s3.upload_file.call_args.args[0], "/tmp/last.mp4")
 
     def test_local_path_overrides_vhs_filenames(self):
         vhs = (True, ["/tmp/vhs.mp4"])
-        result, _ = self._run_successful_upload(
+        _, mock_s3 = self._run_successful_upload(
             local_path="/tmp/explicit.mp4", vhs_filenames=vhs
         )
-        self.assertEqual(result, ("s3://test-bucket/videos/explicit.mp4",))
+        self.assertEqual(
+            mock_s3.upload_file.call_args.args[0], "/tmp/explicit.mp4"
+        )
 
     # ------------------------------------------------------------------
     # Native VIDEO input
     # ------------------------------------------------------------------
 
     def test_input_types_exposes_optional_native_video(self):
-        self.assertEqual(
-            DX2UploadVideoToS3.INPUT_TYPES()["optional"]["video"],
-            ("VIDEO",),
-        )
+        optional_inputs = DX2UploadVideoToS3.INPUT_TYPES()["optional"]
+        self.assertEqual(optional_inputs["video"], ("VIDEO",))
+        self.assertIn("s3_path", optional_inputs)
+        self.assertIn("file_name", optional_inputs)
+        self.assertNotIn("s3_key_prefix", optional_inputs)
+        self.assertNotIn("job_id", optional_inputs)
 
     def test_native_video_is_serialized_uploaded_and_cleaned_up(self):
         video = MagicMock()
@@ -186,21 +263,33 @@ class TestUploadVideo(unittest.TestCase):
         video.save_to.side_effect = write_video
 
         with patch.dict(os.environ, self.BASE_ENV):
-            with patch("boto3.client") as mock_boto:
+            with patch("nodes.datetime") as mock_datetime, patch(
+                "boto3.client"
+            ) as mock_boto:
+                mock_datetime.now.return_value.strftime.return_value = (
+                    self.FIXED_TIMESTAMP
+                )
                 mock_s3 = MagicMock()
                 mock_boto.return_value = mock_s3
-                result = self._node().upload_video(video=video)
+                result = self._node().upload_video(
+                    video=video,
+                    s3_path="videos/minimax-h3",
+                    file_name="test",
+                )
 
         temporary_path = video.save_to.call_args.args[0]
         self.assertTrue(temporary_path.endswith(".mp4"))
         mock_s3.upload_file.assert_called_once_with(
             temporary_path,
             "test-bucket",
-            f"videos/{os.path.basename(temporary_path)}",
+            f"videos/minimax-h3/test-{self.FIXED_TIMESTAMP}.mp4",
         )
         self.assertEqual(
             result,
-            (f"s3://test-bucket/videos/{os.path.basename(temporary_path)}",),
+            (
+                "s3://test-bucket/videos/minimax-h3/"
+                f"test-{self.FIXED_TIMESTAMP}.mp4"
+            ),
         )
         self.assertFalse(os.path.exists(temporary_path))
 
@@ -267,7 +356,12 @@ class TestUploadVideo(unittest.TestCase):
     def _run_upload_with_side_effect(self, side_effect, **kwargs):
         with patch.dict(os.environ, self.BASE_ENV):
             with patch("os.path.isfile", return_value=True):
-                with patch("boto3.client") as mock_boto:
+                with patch("nodes.datetime") as mock_datetime, patch(
+                    "boto3.client"
+                ) as mock_boto:
+                    mock_datetime.now.return_value.strftime.return_value = (
+                        self.FIXED_TIMESTAMP
+                    )
                     mock_s3 = MagicMock()
                     mock_s3.upload_file.side_effect = side_effect
                     mock_boto.return_value = mock_s3
@@ -275,7 +369,7 @@ class TestUploadVideo(unittest.TestCase):
 
     def test_client_error_raises_runtime_error(self):
         local_path = "/tmp/video.mp4"
-        expected_key = f"videos/{os.path.basename(local_path)}"
+        expected_key = f"videos/{self.FIXED_TIMESTAMP}.mp4"
         error = ClientError(
             {"Error": {"Code": "AccessDenied", "Message": "Access Denied"}},
             "UploadFile",

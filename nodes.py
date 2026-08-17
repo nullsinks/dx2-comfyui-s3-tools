@@ -19,7 +19,10 @@ Optional environment variables:
 
 import os
 import logging
+import re
 import tempfile
+from datetime import datetime, timezone
+from pathlib import Path, PurePosixPath
 
 import boto3
 from boto3.exceptions import S3UploadFailedError
@@ -54,13 +57,13 @@ class DX2UploadVideoToS3:
                 # VHS_FILENAMES is a (save_output: bool, filepaths: list[str]) tuple
                 # emitted by ComfyUI-VideoHelperSuite's VHS_VideoCombine node.
                 "vhs_filenames": ("VHS_FILENAMES",),
-                "job_id": (
-                    "STRING",
-                    {"default": "", "multiline": False},
-                ),
-                "s3_key_prefix": (
+                "s3_path": (
                     "STRING",
                     {"default": "videos", "multiline": False},
+                ),
+                "file_name": (
+                    "STRING",
+                    {"default": "", "multiline": False},
                 ),
                 "enabled": ("BOOLEAN", {"default": True}),
             },
@@ -80,8 +83,8 @@ class DX2UploadVideoToS3:
         self,
         local_path: str = "",
         vhs_filenames=None,
-        job_id: str = "",
-        s3_key_prefix: str = "videos",
+        s3_path: str = "videos",
+        file_name: str = "",
         enabled: bool = True,
         video=None,
     ):
@@ -95,12 +98,11 @@ class DX2UploadVideoToS3:
             VHS_FILENAMES payload from VHS_VideoCombine:
             ``(save_output: bool, filepaths: list[str])``.
             The last filepath in the list is used.
-        job_id:
-            Optional job/run identifier inserted into the S3 key.
-            Key pattern with job_id:    ``{prefix}/{job_id}/{filename}``
-            Key pattern without job_id: ``{prefix}/{filename}``
-        s3_key_prefix:
-            Leading path component(s) for the S3 key (default: ``videos``).
+        s3_path:
+            Destination folder within the bucket (default: ``videos``).
+        file_name:
+            Optional user-facing filename. A UTC timestamp is appended to keep
+            uploads collision-safe. The source extension is used when omitted.
         enabled:
             Set to *False* to skip the upload and return ``"upload_skipped"``.
         video:
@@ -151,14 +153,20 @@ class DX2UploadVideoToS3:
                 )
 
             # --------------------------------------------------------------
-            # 3. Build the S3 key
+            # 3. Build the S3 key independently from the local source name.
+            #    Native VIDEO sources use a randomly named temporary file, but
+            #    that implementation detail must not leak into the S3 key.
             # --------------------------------------------------------------
-            filename = os.path.basename(resolved_path)
-            job_id = job_id.strip()
-            if job_id:
-                s3_key = f"{s3_key_prefix}/{job_id}/{filename}"
-            else:
-                s3_key = f"{s3_key_prefix}/{filename}"
+            timestamp = datetime.now(timezone.utc).strftime(
+                "%Y%m%dT%H%M%S_%fZ"
+            )
+            normalized_s3_path = self._normalize_s3_path(s3_path)
+            filename = self._build_destination_filename(
+                source_path=resolved_path,
+                requested_name=file_name,
+                timestamp=timestamp,
+            )
+            s3_key = f"{normalized_s3_path}/{filename}"
 
             logger.info(
                 "DX2UploadVideoToS3: uploading to s3://%s/%s (endpoint: %s)",
@@ -222,6 +230,46 @@ class DX2UploadVideoToS3:
             "Connect video (VIDEO), local_path (STRING), or "
             "vhs_filenames (VHS_FILENAMES)."
         )
+
+    @staticmethod
+    def _normalize_s3_path(s3_path: str) -> str:
+        """Normalize the destination folder and fall back to ``videos``."""
+        raw_path = (s3_path or "").strip().strip("/")
+
+        if not raw_path:
+            return "videos"
+
+        parts = [
+            part
+            for part in PurePosixPath(raw_path).parts
+            if part not in ("", ".", "..", "/")
+        ]
+        return "/".join(parts) or "videos"
+
+    @staticmethod
+    def _build_destination_filename(
+        source_path: str,
+        requested_name: str,
+        timestamp: str,
+    ) -> str:
+        """Build ``name-timestamp.ext`` or ``timestamp.ext``."""
+        source_suffix = Path(source_path).suffix.lower() or ".mp4"
+        requested_name = (requested_name or "").strip()
+
+        if not requested_name:
+            return f"{timestamp}{source_suffix}"
+
+        requested_filename = Path(requested_name).name
+        requested_path = Path(requested_filename)
+        requested_suffix = requested_path.suffix.lower()
+        suffix = requested_suffix or source_suffix
+        stem = requested_path.stem if requested_suffix else requested_filename
+        safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("._-")
+
+        if not safe_stem:
+            return f"{timestamp}{suffix}"
+
+        return f"{safe_stem}-{timestamp}{suffix}"
 
     @staticmethod
     def _build_s3_client(endpoint_url, region: str, access_key: str, secret_key: str):
