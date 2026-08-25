@@ -2,10 +2,11 @@
 DX2 ComfyUI S3 Tools – nodes.py
 
 Provides:
-  DX2UploadVideoToS3 – uploads a generated video to an S3-compatible bucket.
+  DX2UploadMediaToS3 – uploads generated media to an S3-compatible bucket.
 
-The node accepts ComfyUI's native VIDEO type, a plain STRING file path, or the
-VHS_FILENAMES output of ComfyUI-VideoHelperSuite's VideoCombine node.
+The node accepts ComfyUI's native IMAGE or VIDEO type, a plain STRING file
+path, or the VHS_FILENAMES output of ComfyUI-VideoHelperSuite's VideoCombine
+node.
 
 Required environment variables:
   S3_BUCKET              – destination bucket name
@@ -31,17 +32,19 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger(__name__)
 
 
-class DX2UploadVideoToS3:
-    """ComfyUI node: upload a generated video to an S3-compatible bucket.
+class DX2UploadMediaToS3:
+    """ComfyUI node: upload generated media to an S3-compatible bucket.
 
     Wiring options
     --------------
+    - Connect any ComfyUI IMAGE output to *image*.
     - Connect the VIDEO output of ComfyUI's CreateVideo to *video*.
     - Connect a plain file-path string to *local_path*.
     - Connect the VHS_FILENAMES output of VHS_VideoCombine to *vhs_filenames*
       (the last file in the list is used).
     - All source inputs are optional individually; at least one must be provided.
-      Priority is *video*, then *local_path*, then *vhs_filenames*.
+      Priority is *image*, then *video*, then *local_path*, then
+      *vhs_filenames*.
     """
 
     @classmethod
@@ -49,6 +52,7 @@ class DX2UploadVideoToS3:
         return {
             "required": {},
             "optional": {
+                "image": ("IMAGE",),
                 "video": ("VIDEO",),
                 "local_path": (
                     "STRING",
@@ -59,7 +63,7 @@ class DX2UploadVideoToS3:
                 "vhs_filenames": ("VHS_FILENAMES",),
                 "s3_path": (
                     "STRING",
-                    {"default": "videos", "multiline": False},
+                    {"default": "media", "multiline": False},
                 ),
                 "file_name": (
                     "STRING",
@@ -71,7 +75,7 @@ class DX2UploadVideoToS3:
 
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("upload_info",)
-    FUNCTION = "upload_video"
+    FUNCTION = "upload_media"
     CATEGORY = "DX2/IO"
     OUTPUT_NODE = True
 
@@ -79,27 +83,28 @@ class DX2UploadVideoToS3:
     # Main execution
     # ------------------------------------------------------------------
 
-    def upload_video(
+    def upload_media(
         self,
         local_path: str = "",
         vhs_filenames=None,
-        s3_path: str = "videos",
+        s3_path: str = "media",
         file_name: str = "",
         enabled: bool = True,
         video=None,
+        image=None,
     ):
-        """Upload a video to S3 and return the destination URI.
+        """Upload media to S3 and return destination information.
 
         Parameters
         ----------
         local_path:
-            Explicit filesystem path to the video file (STRING input).
+            Explicit filesystem path to an existing media file (STRING input).
         vhs_filenames:
             VHS_FILENAMES payload from VHS_VideoCombine:
             ``(save_output: bool, filepaths: list[str])``.
             The last filepath in the list is used.
         s3_path:
-            Destination folder within the bucket (default: ``videos``).
+            Destination folder within the bucket (default: ``media``).
         file_name:
             Optional user-facing filename. A UTC timestamp is appended to keep
             uploads collision-safe. The source extension is used when omitted.
@@ -108,30 +113,41 @@ class DX2UploadVideoToS3:
         video:
             Native ComfyUI VIDEO object. It is serialized to a temporary MP4,
             which is removed after the upload attempt.
+        image:
+            Native ComfyUI IMAGE tensor. Each batch item is serialized to a
+            temporary PNG, which is removed after the upload attempt.
         """
         if not enabled:
-            logger.info("DX2UploadVideoToS3: upload disabled – skipping.")
+            logger.info("DX2UploadMediaToS3: upload disabled – skipping.")
             return ("upload_skipped",)
 
-        temporary_path = None
+        temporary_paths = []
         try:
             # --------------------------------------------------------------
             # 1. Resolve or materialize the local file path
             # --------------------------------------------------------------
-            if video is not None:
+            is_image_upload = image is not None
+            if is_image_upload:
+                resolved_paths = self._materialize_images(image, temporary_paths)
+                resolved_path = resolved_paths[0]
+            elif video is not None:
                 file_descriptor, temporary_path = tempfile.mkstemp(suffix=".mp4")
                 os.close(file_descriptor)
+                temporary_paths.append(temporary_path)
                 video.save_to(temporary_path)
                 resolved_path = temporary_path
+                resolved_paths = [resolved_path]
             else:
                 resolved_path = self._resolve_path(local_path, vhs_filenames)
+                resolved_paths = [resolved_path]
 
-            logger.info("DX2UploadVideoToS3: resolved local path → %s", resolved_path)
+            logger.info("DX2UploadMediaToS3: resolved local paths → %s", resolved_paths)
 
-            if not os.path.isfile(resolved_path):
-                raise FileNotFoundError(
-                    f"DX2UploadVideoToS3: file not found: {resolved_path}"
-                )
+            for resolved_path in resolved_paths:
+                if not os.path.isfile(resolved_path):
+                    raise FileNotFoundError(
+                        f"DX2UploadMediaToS3: file not found: {resolved_path}"
+                    )
 
             # --------------------------------------------------------------
             # 2. Read S3 configuration from environment
@@ -144,36 +160,35 @@ class DX2UploadVideoToS3:
 
             if not bucket:
                 raise EnvironmentError(
-                    "DX2UploadVideoToS3: S3_BUCKET environment variable is not set."
+                    "DX2UploadMediaToS3: S3_BUCKET environment variable is not set."
                 )
             if not access_key or not secret_key:
                 raise EnvironmentError(
-                    "DX2UploadVideoToS3: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY "
+                    "DX2UploadMediaToS3: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY "
                     "must both be set."
                 )
 
             # --------------------------------------------------------------
-            # 3. Build the S3 key independently from the local source name.
-            #    Native VIDEO sources use a randomly named temporary file, but
-            #    that implementation detail must not leak into the S3 key.
+            # 3. Build S3 keys independently from local source names. Native
+            #    media uses random temporary files, but that implementation
+            #    detail must not leak into S3 keys.
             # --------------------------------------------------------------
             timestamp = datetime.now(timezone.utc).strftime(
                 "%Y%m%dT%H%M%S_%fZ"
             )
             normalized_s3_path = self._normalize_s3_path(s3_path)
-            filename = self._build_destination_filename(
-                source_path=resolved_path,
-                requested_name=file_name,
-                timestamp=timestamp,
-            )
-            s3_key = f"{normalized_s3_path}/{filename}"
-
-            logger.info(
-                "DX2UploadVideoToS3: uploading to s3://%s/%s (endpoint: %s)",
-                bucket,
-                s3_key,
-                endpoint_url or "default AWS endpoint",
-            )
+            upload_jobs = []
+            is_batch = is_image_upload and len(resolved_paths) > 1
+            for index, resolved_path in enumerate(resolved_paths):
+                filename = self._build_destination_filename(
+                    source_path=resolved_path,
+                    requested_name=file_name,
+                    timestamp=timestamp,
+                    forced_suffix=".png" if is_image_upload else None,
+                    batch_index=index if is_batch else None,
+                )
+                s3_key = f"{normalized_s3_path}/{filename}"
+                upload_jobs.append((resolved_path, s3_key))
 
             # --------------------------------------------------------------
             # 4. Upload
@@ -181,20 +196,29 @@ class DX2UploadVideoToS3:
             s3_client = self._build_s3_client(
                 endpoint_url, region, access_key, secret_key
             )
-            self._upload(s3_client, resolved_path, bucket, s3_key)
+            upload_info = ""
+            for resolved_path, s3_key in upload_jobs:
+                logger.info(
+                    "DX2UploadMediaToS3: uploading to "
+                    "s3://%s/%s (endpoint: %s)",
+                    bucket,
+                    s3_key,
+                    endpoint_url or "default AWS endpoint",
+                )
+                self._upload(s3_client, resolved_path, bucket, s3_key)
+                upload_info = f"s3://{bucket}/{s3_key}"
 
-            upload_info = f"s3://{bucket}/{s3_key}"
-            logger.info("DX2UploadVideoToS3: upload succeeded → %s", upload_info)
+            logger.info("DX2UploadMediaToS3: upload succeeded → %s", upload_info)
             return (upload_info,)
         finally:
-            if temporary_path is not None:
+            for temporary_path in temporary_paths:
                 try:
                     os.remove(temporary_path)
                 except FileNotFoundError:
                     pass
                 except OSError:
                     logger.warning(
-                        "DX2UploadVideoToS3: failed to remove temporary video %s",
+                        "DX2UploadMediaToS3: failed to remove temporary file %s",
                         temporary_path,
                         exc_info=True,
                     )
@@ -218,7 +242,7 @@ class DX2UploadVideoToS3:
                 _, filepaths = vhs_filenames
             except (TypeError, ValueError) as exc:
                 raise ValueError(
-                    "DX2UploadVideoToS3: vhs_filenames is not a valid VHS_FILENAMES "
+                    "DX2UploadMediaToS3: vhs_filenames is not a valid VHS_FILENAMES "
                     f"payload (expected a 2-tuple): {exc}"
                 ) from exc
 
@@ -226,50 +250,97 @@ class DX2UploadVideoToS3:
                 return filepaths[-1]
 
         raise ValueError(
-            "DX2UploadVideoToS3: no file path provided. "
-            "Connect video (VIDEO), local_path (STRING), or "
+            "DX2UploadMediaToS3: no media provided. "
+            "Connect image (IMAGE), video (VIDEO), local_path (STRING), or "
             "vhs_filenames (VHS_FILENAMES)."
         )
 
     @staticmethod
+    def _materialize_images(image, temporary_paths) -> list[str]:
+        """Serialize every IMAGE batch item to a temporary PNG file."""
+        try:
+            shape = tuple(image.shape)
+        except (AttributeError, TypeError) as exc:
+            raise ValueError(
+                "DX2UploadMediaToS3: image must be a ComfyUI IMAGE tensor."
+            ) from exc
+
+        if len(shape) != 4:
+            raise ValueError(
+                "DX2UploadMediaToS3: image must have shape "
+                "[batch, height, width, channels]."
+            )
+        if shape[0] < 1:
+            raise ValueError("DX2UploadMediaToS3: image batch is empty.")
+        if shape[-1] not in (1, 3, 4):
+            raise ValueError(
+                "DX2UploadMediaToS3: image must have 1, 3, or 4 channels."
+            )
+
+        # NumPy and Pillow are provided by the ComfyUI runtime. Import them
+        # lazily so path and video uploads do not add an import-time dependency.
+        import numpy as np
+        from PIL import Image
+
+        resolved_paths = []
+        for image_tensor in image:
+            file_descriptor, temporary_path = tempfile.mkstemp(suffix=".png")
+            os.close(file_descriptor)
+            temporary_paths.append(temporary_path)
+
+            if hasattr(image_tensor, "detach"):
+                image_tensor = image_tensor.detach()
+            image_array = image_tensor.cpu().numpy()
+            image_array = np.clip(255.0 * image_array, 0, 255).astype(np.uint8)
+            if shape[-1] == 1:
+                image_array = image_array[..., 0]
+            Image.fromarray(image_array).save(temporary_path, format="PNG")
+            resolved_paths.append(temporary_path)
+
+        return resolved_paths
+
+    @staticmethod
     def _normalize_s3_path(s3_path: str) -> str:
-        """Normalize the destination folder and fall back to ``videos``."""
+        """Normalize the destination folder and fall back to ``media``."""
         raw_path = (s3_path or "").strip().strip("/")
 
         if not raw_path:
-            return "videos"
+            return "media"
 
         parts = [
             part
             for part in PurePosixPath(raw_path).parts
             if part not in ("", ".", "..", "/")
         ]
-        return "/".join(parts) or "videos"
+        return "/".join(parts) or "media"
 
     @staticmethod
     def _build_destination_filename(
         source_path: str,
         requested_name: str,
         timestamp: str,
+        forced_suffix=None,
+        batch_index=None,
     ) -> str:
         """Build ``name-timestamp.ext`` or ``timestamp.ext``."""
-        source_suffix = Path(source_path).suffix.lower() or ".mp4"
+        source_suffix = forced_suffix or Path(source_path).suffix.lower() or ".mp4"
         requested_name = (requested_name or "").strip()
 
-        if not requested_name:
-            return f"{timestamp}{source_suffix}"
+        safe_stem = ""
+        suffix = source_suffix
+        if requested_name:
+            requested_filename = Path(requested_name).name
+            requested_path = Path(requested_filename)
+            requested_suffix = requested_path.suffix.lower()
+            if forced_suffix is None:
+                suffix = requested_suffix or source_suffix
+            stem = requested_path.stem if requested_suffix else requested_filename
+            safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("._-")
 
-        requested_filename = Path(requested_name).name
-        requested_path = Path(requested_filename)
-        requested_suffix = requested_path.suffix.lower()
-        suffix = requested_suffix or source_suffix
-        stem = requested_path.stem if requested_suffix else requested_filename
-        safe_stem = re.sub(r"[^A-Za-z0-9._-]+", "-", stem).strip("._-")
-
-        if not safe_stem:
-            return f"{timestamp}{suffix}"
-
-        return f"{safe_stem}-{timestamp}{suffix}"
+        base_name = f"{safe_stem}-{timestamp}" if safe_stem else timestamp
+        if batch_index is not None:
+            base_name = f"{base_name}-{batch_index + 1:04d}"
+        return f"{base_name}{suffix}"
 
     @staticmethod
     def _build_s3_client(endpoint_url, region: str, access_key: str, secret_key: str):
@@ -306,7 +377,7 @@ class DX2UploadVideoToS3:
             s3_client.upload_file(local_path, bucket, s3_key)
         except (ClientError, S3UploadFailedError) as exc:
             raise RuntimeError(
-                f"DX2UploadVideoToS3: upload failed for "
+                f"DX2UploadMediaToS3: upload failed for "
                 f"s3://{bucket}/{s3_key}: {exc}"
             ) from exc
 
@@ -316,9 +387,9 @@ class DX2UploadVideoToS3:
 # ------------------------------------------------------------------
 
 NODE_CLASS_MAPPINGS = {
-    "DX2UploadVideoToS3": DX2UploadVideoToS3,
+    "DX2UploadMediaToS3": DX2UploadMediaToS3,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "DX2UploadVideoToS3": "DX2 Upload Video to S3",
+    "DX2UploadMediaToS3": "DX2 Upload Media to S3",
 }
