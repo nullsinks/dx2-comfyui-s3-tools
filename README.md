@@ -21,6 +21,7 @@ VideoHelperSuite output to an S3-compatible bucket.
 | `s3_path` | STRING | No | Destination folder within the bucket (default: `media`). Use `image` or `videos` for type-specific folders. |
 | `file_name` | STRING | No | Optional filename stem. A UTC timestamp is appended to prevent collisions. |
 | `enabled` | BOOLEAN | No | Set to `false` to skip uploading and return `"upload_skipped"` (default: `true`). |
+| `upload_workflow` | BOOLEAN | No | Upload a JSON workflow-provenance sidecar beside every media object (default: `true`). |
 
 At least one media source must be connected. When multiple sources are
 provided, priority is `image`, then `video`, then `local_path`, then
@@ -45,6 +46,31 @@ s3://my-bucket/media/test-20260816T193012_123456Z.mp4
 ```text
 s3://my-bucket/image/ComfyUI-20260816T193012_123456Z.png
 ```
+
+#### Workflow provenance sidecars
+
+When `upload_workflow` is `true`, each media object receives a same-stem
+`.workflow.json` companion in the same S3 folder:
+
+```text
+s3://my-bucket/media/test-20260816T193012_123456Z.mp4
+s3://my-bucket/media/test-20260816T193012_123456Z.workflow.json
+```
+
+The versioned JSON envelope contains the media URI and batch position, the
+complete prompt executed by ComfyUI, the editable UI workflow when the client
+provides one, and any other `EXTRA_PNGINFO` supplied by extensions. API callers
+that do not submit an editable workflow still receive a sidecar with
+`workflow: null`. Image batches receive one sidecar per PNG.
+
+Sidecars are best-effort: serialization or sidecar-upload failures are logged,
+but a successful media upload still returns its media URI. Set
+`upload_workflow` to `false` to upload only media.
+
+> [!WARNING]
+> Workflow metadata can contain prompts, local paths, model names, and values
+> entered into third-party node widgets. Review workflows for credentials or
+> other sensitive values before storing sidecars in a shared bucket.
 
 ## Installation
 
@@ -106,7 +132,8 @@ API workflow example:
     "image": ["16", 0],
     "s3_path": "image",
     "file_name": "ComfyUI",
-    "enabled": true
+    "enabled": true,
+    "upload_workflow": true
   }
 }
 ```
@@ -147,6 +174,12 @@ release.
   retain the old destination.
 - Workflows that are not migrated should remain pinned to release tag `v0.2.0`.
 
+## Upgrading from v0.3.0
+
+Version 0.4.0 enables workflow sidecars by default. Existing API and UI
+workflows may omit `upload_workflow` and inherit `true`; set it explicitly to
+`false` to retain media-only uploads.
+
 ## Error handling
 
 | Situation | Behavior |
@@ -155,7 +188,8 @@ release.
 | Invalid or empty IMAGE batch | Raises `ValueError` before contacting S3. |
 | File not found | Raises `FileNotFoundError` with the resolved path. |
 | Missing credentials | Raises `EnvironmentError` naming the missing configuration. |
-| Upload failure | Raises `RuntimeError` with `s3://bucket/key` context. |
+| Media upload failure | Raises `RuntimeError` with `s3://bucket/key` context. |
+| Workflow sidecar failure | Logs a warning and returns the successful media URI. |
 | `enabled` is `false` | Returns `"upload_skipped"` without side effects. |
 
 If an image batch fails partway through, already-uploaded objects remain in S3;

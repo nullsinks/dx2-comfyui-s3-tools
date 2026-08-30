@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0
+
+- Added default-on `.workflow.json` provenance sidecars for every uploaded
+  image and video.
+- Captured ComfyUI's executed prompt, editable workflow when available, and
+  extension-provided metadata in a versioned JSON envelope.
+- Added the `upload_workflow` boolean input for explicit opt-out.
+- Kept sidecar failures best-effort so successful media uploads still return
+  their media URI.
+
 ## 0.3.0
 
 - Replaced `DX2UploadVideoToS3` with the generalized
