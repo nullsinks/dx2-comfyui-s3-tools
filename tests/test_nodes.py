@@ -1,5 +1,6 @@
 """Unit tests for DX2UploadMediaToS3 node (nodes.py)."""
 
+import json
 import os
 import tempfile
 import unittest
@@ -98,6 +99,12 @@ class TestS3Naming(unittest.TestCase):
         )
         self.assertEqual(result, f"photo-{self.TIMESTAMP}-0002.png")
 
+    def test_builds_workflow_sidecar_key_from_media_key(self):
+        result = DX2UploadMediaToS3._build_sidecar_key(
+            "videos/minimax-h3/example.mp4"
+        )
+        self.assertEqual(result, "videos/minimax-h3/example.workflow.json")
+
 
 class TestNodeRegistration(unittest.TestCase):
     def test_registers_only_generalized_media_node(self):
@@ -184,6 +191,7 @@ class TestUploadMedia(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def _run_successful_upload(self, **kwargs):
+        kwargs.setdefault("upload_workflow", False)
         with patch.dict(os.environ, self.BASE_ENV):
             with patch("os.path.isfile", return_value=True):
                 with patch("nodes.datetime") as mock_datetime, patch(
@@ -239,6 +247,165 @@ class TestUploadMedia(unittest.TestCase):
             f"videos/wan2.2/test-{self.FIXED_TIMESTAMP}.mp4",
         )
 
+    def test_workflow_sidecar_is_enabled_by_default_and_preserves_metadata(self):
+        prompt = {
+            "17": {
+                "class_type": "CreateVideo",
+                "inputs": {"frames": ["16", 0]},
+            }
+        }
+        extra_pnginfo = {
+            "workflow": {"nodes": [{"id": 17, "type": "CreateVideo"}]},
+            "extension_data": {"label": "café"},
+        }
+        captured = {}
+
+        def capture_upload(path, bucket, key):
+            if key.endswith(".workflow.json"):
+                with open(path, encoding="utf-8") as sidecar:
+                    captured["payload"] = json.load(sidecar)
+                captured["path"] = path
+
+        with patch.dict(os.environ, self.BASE_ENV):
+            with patch("os.path.isfile", return_value=True):
+                with patch("nodes.datetime") as mock_datetime, patch(
+                    "boto3.client"
+                ) as mock_boto:
+                    mock_datetime.now.return_value.strftime.return_value = (
+                        self.FIXED_TIMESTAMP
+                    )
+                    mock_s3 = MagicMock()
+                    mock_s3.upload_file.side_effect = capture_upload
+                    mock_boto.return_value = mock_s3
+                    result = self._node().upload_media(
+                        local_path="/tmp/video.mp4",
+                        s3_path="videos/minimax-h3",
+                        file_name="example",
+                        prompt=prompt,
+                        extra_pnginfo=extra_pnginfo,
+                    )
+
+        media_key = f"videos/minimax-h3/example-{self.FIXED_TIMESTAMP}.mp4"
+        sidecar_key = (
+            f"videos/minimax-h3/example-{self.FIXED_TIMESTAMP}.workflow.json"
+        )
+        self.assertEqual(
+            [call.args[2] for call in mock_s3.upload_file.call_args_list],
+            [media_key, sidecar_key],
+        )
+        self.assertEqual(result, (f"s3://test-bucket/{media_key}",))
+        self.assertEqual(
+            captured["payload"],
+            {
+                "schema_version": 1,
+                "captured_at": self.FIXED_TIMESTAMP,
+                "media": {
+                    "s3_uri": f"s3://test-bucket/{media_key}",
+                    "filename": f"example-{self.FIXED_TIMESTAMP}.mp4",
+                    "batch_index": 1,
+                    "batch_count": 1,
+                },
+                "comfyui": {
+                    "prompt": prompt,
+                    "workflow": extra_pnginfo["workflow"],
+                    "extra_pnginfo": {
+                        "extension_data": {"label": "café"}
+                    },
+                },
+            },
+        )
+        self.assertFalse(os.path.exists(captured["path"]))
+
+    def test_missing_workflow_metadata_is_written_as_null(self):
+        captured = {}
+
+        def capture_upload(path, bucket, key):
+            if key.endswith(".workflow.json"):
+                with open(path, encoding="utf-8") as sidecar:
+                    captured.update(json.load(sidecar))
+
+        with patch.dict(os.environ, self.BASE_ENV):
+            with patch("os.path.isfile", return_value=True), patch(
+                "boto3.client"
+            ) as mock_boto:
+                mock_s3 = MagicMock()
+                mock_s3.upload_file.side_effect = capture_upload
+                mock_boto.return_value = mock_s3
+                self._node().upload_media(local_path="/tmp/video.mp4")
+
+        self.assertIsNone(captured["comfyui"]["prompt"])
+        self.assertIsNone(captured["comfyui"]["workflow"])
+        self.assertEqual(captured["comfyui"]["extra_pnginfo"], {})
+
+    def test_upload_workflow_false_uploads_only_media(self):
+        _, mock_s3 = self._run_successful_upload(
+            local_path="/tmp/video.mp4", upload_workflow=False
+        )
+        mock_s3.upload_file.assert_called_once()
+
+    def test_sidecar_upload_failure_warns_and_returns_media_uri(self):
+        error = S3UploadFailedError("Connection reset")
+        created_paths = []
+        real_mkstemp = tempfile.mkstemp
+
+        def recording_mkstemp(*args, **kwargs):
+            descriptor, path = real_mkstemp(*args, **kwargs)
+            created_paths.append(path)
+            return descriptor, path
+
+        with patch.dict(os.environ, self.BASE_ENV):
+            with patch("os.path.isfile", return_value=True), patch(
+                "nodes.datetime"
+            ) as mock_datetime, patch("boto3.client") as mock_boto, patch(
+                "nodes.tempfile.mkstemp", side_effect=recording_mkstemp
+            ):
+                mock_datetime.now.return_value.strftime.return_value = (
+                    self.FIXED_TIMESTAMP
+                )
+                mock_s3 = MagicMock()
+                mock_s3.upload_file.side_effect = [None, error]
+                mock_boto.return_value = mock_s3
+                with self.assertLogs("nodes", level="WARNING") as logs:
+                    result = self._node().upload_media(
+                        local_path="/tmp/video.mp4"
+                    )
+
+        self.assertEqual(
+            result,
+            (f"s3://test-bucket/media/{self.FIXED_TIMESTAMP}.mp4",),
+        )
+        self.assertIn("workflow sidecar failed", "\n".join(logs.output))
+        self.assertEqual(len(created_paths), 1)
+        self.assertFalse(os.path.exists(created_paths[0]))
+
+    def test_sidecar_serialization_failure_warns_and_cleans_up(self):
+        created_paths = []
+        real_mkstemp = tempfile.mkstemp
+
+        def recording_mkstemp(*args, **kwargs):
+            descriptor, path = real_mkstemp(*args, **kwargs)
+            created_paths.append(path)
+            return descriptor, path
+
+        with patch.dict(os.environ, self.BASE_ENV):
+            with patch("os.path.isfile", return_value=True), patch(
+                "boto3.client"
+            ) as mock_boto, patch(
+                "nodes.tempfile.mkstemp", side_effect=recording_mkstemp
+            ):
+                mock_s3 = MagicMock()
+                mock_boto.return_value = mock_s3
+                with self.assertLogs("nodes", level="WARNING"):
+                    result = self._node().upload_media(
+                        local_path="/tmp/video.mp4",
+                        prompt={"not_json": {"a", "set"}},
+                    )
+
+        self.assertTrue(result[0].endswith(".mp4"))
+        mock_s3.upload_file.assert_called_once()
+        self.assertEqual(len(created_paths), 1)
+        self.assertFalse(os.path.exists(created_paths[0]))
+
     # ------------------------------------------------------------------
     # VHS_FILENAMES input
     # ------------------------------------------------------------------
@@ -277,7 +444,8 @@ class TestUploadMedia(unittest.TestCase):
     # ------------------------------------------------------------------
 
     def test_input_types_exposes_native_media_and_shared_path(self):
-        optional_inputs = DX2UploadMediaToS3.INPUT_TYPES()["optional"]
+        input_types = DX2UploadMediaToS3.INPUT_TYPES()
+        optional_inputs = input_types["optional"]
         self.assertEqual(optional_inputs["image"], ("IMAGE",))
         self.assertEqual(optional_inputs["video"], ("VIDEO",))
         self.assertEqual(
@@ -285,6 +453,16 @@ class TestUploadMedia(unittest.TestCase):
             ("STRING", {"default": "media", "multiline": False}),
         )
         self.assertIn("file_name", optional_inputs)
+        self.assertEqual(
+            optional_inputs["upload_workflow"],
+            ("BOOLEAN", {"default": True}),
+        )
+        self.assertEqual(
+            input_types["hidden"],
+            {"prompt": "PROMPT", "extra_pnginfo": "EXTRA_PNGINFO"},
+        )
+        self.assertNotIn("prompt", optional_inputs)
+        self.assertNotIn("extra_pnginfo", optional_inputs)
         self.assertNotIn("image_s3_path", optional_inputs)
         self.assertNotIn("s3_key_prefix", optional_inputs)
         self.assertNotIn("job_id", optional_inputs)
@@ -311,6 +489,7 @@ class TestUploadMedia(unittest.TestCase):
                     video=video,
                     s3_path="videos/minimax-h3",
                     file_name="test",
+                    upload_workflow=False,
                 )
 
         temporary_path = video.save_to.call_args.args[0]
@@ -347,6 +526,7 @@ class TestUploadMedia(unittest.TestCase):
                     video=video,
                     local_path="/tmp/explicit.mp4",
                     vhs_filenames=vhs,
+                    upload_workflow=False,
                 )
 
         uploaded_path = mock_s3.upload_file.call_args.args[0]
@@ -408,6 +588,7 @@ class TestUploadMedia(unittest.TestCase):
         return image
 
     def _run_image_upload(self, image, **kwargs):
+        kwargs.setdefault("upload_workflow", False)
         with patch.dict(os.environ, self.BASE_ENV):
             with patch("nodes.datetime") as mock_datetime, patch(
                 "boto3.client"
@@ -458,6 +639,51 @@ class TestUploadMedia(unittest.TestCase):
         self.assertEqual([call.args[2] for call in calls], expected_keys)
         self.assertEqual(result, (f"s3://test-bucket/{expected_keys[-1]}",))
         self.assertTrue(all(not os.path.exists(call.args[0]) for call in calls))
+
+    def test_image_batch_uploads_one_workflow_sidecar_per_image(self):
+        payloads = []
+
+        def capture_upload(path, bucket, key):
+            if key.endswith(".workflow.json"):
+                with open(path, encoding="utf-8") as sidecar:
+                    payloads.append(json.load(sidecar))
+
+        with patch.dict(os.environ, self.BASE_ENV):
+            with patch("nodes.datetime") as mock_datetime, patch(
+                "boto3.client"
+            ) as mock_boto:
+                mock_datetime.now.return_value.strftime.return_value = (
+                    self.FIXED_TIMESTAMP
+                )
+                mock_s3 = MagicMock()
+                mock_s3.upload_file.side_effect = capture_upload
+                mock_boto.return_value = mock_s3
+                result = self._node().upload_media(
+                    image=self._image_batch(batch_size=2),
+                    file_name="batch",
+                    prompt={"1": {"class_type": "KSampler", "inputs": {}}},
+                    extra_pnginfo={"workflow": {"nodes": []}},
+                )
+
+        media_keys = [
+            f"media/batch-{self.FIXED_TIMESTAMP}-0001.png",
+            f"media/batch-{self.FIXED_TIMESTAMP}-0002.png",
+        ]
+        sidecar_keys = [
+            f"media/batch-{self.FIXED_TIMESTAMP}-0001.workflow.json",
+            f"media/batch-{self.FIXED_TIMESTAMP}-0002.workflow.json",
+        ]
+        self.assertEqual(
+            [call.args[2] for call in mock_s3.upload_file.call_args_list],
+            [media_keys[0], sidecar_keys[0], media_keys[1], sidecar_keys[1]],
+        )
+        self.assertEqual(
+            [payload["media"]["batch_index"] for payload in payloads], [1, 2]
+        )
+        self.assertTrue(
+            all(payload["media"]["batch_count"] == 2 for payload in payloads)
+        )
+        self.assertEqual(result, (f"s3://test-bucket/{media_keys[-1]}",))
 
     def test_native_image_takes_priority_over_video_and_paths(self):
         video = MagicMock()
@@ -525,7 +751,9 @@ class TestUploadMedia(unittest.TestCase):
                 mock_s3.upload_file.side_effect = [None, error]
                 mock_boto.return_value = mock_s3
                 with self.assertRaises(RuntimeError):
-                    self._node().upload_media(image=image)
+                    self._node().upload_media(
+                        image=image, upload_workflow=False
+                    )
 
         uploaded_paths = [call.args[0] for call in mock_s3.upload_file.call_args_list]
         self.assertEqual(len(uploaded_paths), 2)

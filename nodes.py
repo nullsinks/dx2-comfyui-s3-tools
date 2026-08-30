@@ -18,6 +18,7 @@ Optional environment variables:
   S3_REGION        – region name (default: us-east-1)
 """
 
+import json
 import os
 import logging
 import re
@@ -70,6 +71,11 @@ class DX2UploadMediaToS3:
                     {"default": "", "multiline": False},
                 ),
                 "enabled": ("BOOLEAN", {"default": True}),
+                "upload_workflow": ("BOOLEAN", {"default": True}),
+            },
+            "hidden": {
+                "prompt": "PROMPT",
+                "extra_pnginfo": "EXTRA_PNGINFO",
             },
         }
 
@@ -90,8 +96,11 @@ class DX2UploadMediaToS3:
         s3_path: str = "media",
         file_name: str = "",
         enabled: bool = True,
+        upload_workflow: bool = True,
         video=None,
         image=None,
+        prompt=None,
+        extra_pnginfo=None,
     ):
         """Upload media to S3 and return destination information.
 
@@ -110,6 +119,10 @@ class DX2UploadMediaToS3:
             uploads collision-safe. The source extension is used when omitted.
         enabled:
             Set to *False* to skip the upload and return ``"upload_skipped"``.
+        upload_workflow:
+            Upload a ``.workflow.json`` provenance sidecar for every media
+            object. Sidecar failures are logged without failing the media
+            upload.
         video:
             Native ComfyUI VIDEO object. It is serialized to a temporary MP4,
             which is removed after the upload attempt.
@@ -188,7 +201,7 @@ class DX2UploadMediaToS3:
                     batch_index=index if is_batch else None,
                 )
                 s3_key = f"{normalized_s3_path}/{filename}"
-                upload_jobs.append((resolved_path, s3_key))
+                upload_jobs.append((resolved_path, s3_key, index))
 
             # --------------------------------------------------------------
             # 4. Upload
@@ -197,7 +210,7 @@ class DX2UploadMediaToS3:
                 endpoint_url, region, access_key, secret_key
             )
             upload_info = ""
-            for resolved_path, s3_key in upload_jobs:
+            for resolved_path, s3_key, index in upload_jobs:
                 logger.info(
                     "DX2UploadMediaToS3: uploading to "
                     "s3://%s/%s (endpoint: %s)",
@@ -207,6 +220,35 @@ class DX2UploadMediaToS3:
                 )
                 self._upload(s3_client, resolved_path, bucket, s3_key)
                 upload_info = f"s3://{bucket}/{s3_key}"
+
+                if upload_workflow:
+                    sidecar_key = self._build_sidecar_key(s3_key)
+                    try:
+                        sidecar_path = self._materialize_workflow_sidecar(
+                            media_s3_uri=upload_info,
+                            media_filename=PurePosixPath(s3_key).name,
+                            batch_index=index + 1,
+                            batch_count=len(upload_jobs),
+                            captured_at=timestamp,
+                            prompt=prompt,
+                            extra_pnginfo=extra_pnginfo,
+                            temporary_paths=temporary_paths,
+                        )
+                        logger.info(
+                            "DX2UploadMediaToS3: uploading workflow sidecar to "
+                            "s3://%s/%s",
+                            bucket,
+                            sidecar_key,
+                        )
+                        self._upload(s3_client, sidecar_path, bucket, sidecar_key)
+                    except Exception:
+                        logger.warning(
+                            "DX2UploadMediaToS3: media uploaded, but workflow "
+                            "sidecar failed for s3://%s/%s",
+                            bucket,
+                            sidecar_key,
+                            exc_info=True,
+                        )
 
             logger.info("DX2UploadMediaToS3: upload succeeded → %s", upload_info)
             return (upload_info,)
@@ -298,6 +340,55 @@ class DX2UploadMediaToS3:
             resolved_paths.append(temporary_path)
 
         return resolved_paths
+
+    @staticmethod
+    def _build_sidecar_key(media_s3_key: str) -> str:
+        """Return the same S3 key stem with a ``.workflow.json`` suffix."""
+        return str(PurePosixPath(media_s3_key).with_suffix(".workflow.json"))
+
+    @staticmethod
+    def _materialize_workflow_sidecar(
+        *,
+        media_s3_uri: str,
+        media_filename: str,
+        batch_index: int,
+        batch_count: int,
+        captured_at: str,
+        prompt,
+        extra_pnginfo,
+        temporary_paths,
+    ) -> str:
+        """Write a versioned workflow-provenance envelope to a temp file."""
+        metadata = extra_pnginfo if isinstance(extra_pnginfo, dict) else {}
+        workflow = metadata.get("workflow")
+        remaining_metadata = {
+            key: value for key, value in metadata.items() if key != "workflow"
+        }
+        envelope = {
+            "schema_version": 1,
+            "captured_at": captured_at,
+            "media": {
+                "s3_uri": media_s3_uri,
+                "filename": media_filename,
+                "batch_index": batch_index,
+                "batch_count": batch_count,
+            },
+            "comfyui": {
+                "prompt": prompt,
+                "workflow": workflow,
+                "extra_pnginfo": remaining_metadata,
+            },
+        }
+
+        file_descriptor, temporary_path = tempfile.mkstemp(
+            suffix=".workflow.json"
+        )
+        os.close(file_descriptor)
+        temporary_paths.append(temporary_path)
+        with open(temporary_path, "w", encoding="utf-8", newline="\n") as output:
+            json.dump(envelope, output, ensure_ascii=False, indent=2)
+            output.write("\n")
+        return temporary_path
 
     @staticmethod
     def _normalize_s3_path(s3_path: str) -> str:
