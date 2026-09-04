@@ -343,8 +343,10 @@ class DX2UploadMediaToS3:
 
     @staticmethod
     def _build_sidecar_key(media_s3_key: str) -> str:
-        """Return the same S3 key stem with a ``.workflow.json`` suffix."""
-        return str(PurePosixPath(media_s3_key).with_suffix(".workflow.json"))
+        """Return a same-stem key inside the media folder's ``workflows``."""
+        media_path = PurePosixPath(media_s3_key)
+        sidecar_name = media_path.with_suffix(".workflow.json").name
+        return str(media_path.parent / "workflows" / sidecar_name)
 
     @staticmethod
     def _materialize_workflow_sidecar(

@@ -21,7 +21,7 @@ VideoHelperSuite output to an S3-compatible bucket.
 | `s3_path` | STRING | No | Destination folder within the bucket (default: `media`). Use `image` or `videos` for type-specific folders. |
 | `file_name` | STRING | No | Optional filename stem. A UTC timestamp is appended to prevent collisions. |
 | `enabled` | BOOLEAN | No | Set to `false` to skip uploading and return `"upload_skipped"` (default: `true`). |
-| `upload_workflow` | BOOLEAN | No | Upload a JSON workflow-provenance sidecar beside every media object (default: `true`). |
+| `upload_workflow` | BOOLEAN | No | Upload a JSON workflow-provenance sidecar under the destination's `workflows/` folder (default: `true`). |
 
 At least one media source must be connected. When multiple sources are
 provided, priority is `image`, then `video`, then `local_path`, then
@@ -50,12 +50,15 @@ s3://my-bucket/image/ComfyUI-20260816T193012_123456Z.png
 #### Workflow provenance sidecars
 
 When `upload_workflow` is `true`, each media object receives a same-stem
-`.workflow.json` companion in the same S3 folder:
+`.workflow.json` companion in a `workflows/` child folder:
 
 ```text
 s3://my-bucket/media/test-20260816T193012_123456Z.mp4
-s3://my-bucket/media/test-20260816T193012_123456Z.workflow.json
+s3://my-bucket/media/workflows/test-20260816T193012_123456Z.workflow.json
 ```
+
+The separate folder prevents media filename-prefix searches from also
+returning workflow sidecars.
 
 The versioned JSON envelope contains the media URI and batch position, the
 complete prompt executed by ComfyUI, the editable UI workflow when the client
