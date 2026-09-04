@@ -103,7 +103,9 @@ class TestS3Naming(unittest.TestCase):
         result = DX2UploadMediaToS3._build_sidecar_key(
             "videos/minimax-h3/example.mp4"
         )
-        self.assertEqual(result, "videos/minimax-h3/example.workflow.json")
+        self.assertEqual(
+            result, "videos/minimax-h3/workflows/example.workflow.json"
+        )
 
 
 class TestNodeRegistration(unittest.TestCase):
@@ -287,7 +289,8 @@ class TestUploadMedia(unittest.TestCase):
 
         media_key = f"videos/minimax-h3/example-{self.FIXED_TIMESTAMP}.mp4"
         sidecar_key = (
-            f"videos/minimax-h3/example-{self.FIXED_TIMESTAMP}.workflow.json"
+            "videos/minimax-h3/workflows/"
+            f"example-{self.FIXED_TIMESTAMP}.workflow.json"
         )
         self.assertEqual(
             [call.args[2] for call in mock_s3.upload_file.call_args_list],
@@ -670,8 +673,8 @@ class TestUploadMedia(unittest.TestCase):
             f"media/batch-{self.FIXED_TIMESTAMP}-0002.png",
         ]
         sidecar_keys = [
-            f"media/batch-{self.FIXED_TIMESTAMP}-0001.workflow.json",
-            f"media/batch-{self.FIXED_TIMESTAMP}-0002.workflow.json",
+            f"media/workflows/batch-{self.FIXED_TIMESTAMP}-0001.workflow.json",
+            f"media/workflows/batch-{self.FIXED_TIMESTAMP}-0002.workflow.json",
         ]
         self.assertEqual(
             [call.args[2] for call in mock_s3.upload_file.call_args_list],
