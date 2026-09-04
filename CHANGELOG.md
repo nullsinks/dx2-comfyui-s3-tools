@@ -1,9 +1,14 @@
 # Changelog
 
+## 0.4.1
+
+- Moved workflow provenance sidecars into a dedicated `workflows/` child
+  folder so media filename-prefix searches do not also return sidecars.
+
 ## 0.4.0
 
-- Added default-on `.workflow.json` provenance sidecars under a dedicated
-  `workflows/` folder for every uploaded image and video.
+- Added default-on `.workflow.json` provenance sidecars for every uploaded
+  image and video.
 - Captured ComfyUI's executed prompt, editable workflow when available, and
   extension-provided metadata in a versioned JSON envelope.
 - Added the `upload_workflow` boolean input for explicit opt-out.
