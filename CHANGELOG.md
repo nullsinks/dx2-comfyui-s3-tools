@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Added an optional native `AUDIO` input for mono/stereo batches, encoded as
+  24-bit FLAC with PyAV at the source sample rate. Existing input positions and
+  the single-URI return contract are preserved.
+- Reused media naming, per-track workflow sidecars, and temporary-file cleanup
+  for audio. Invalid audio and out-of-range samples fail before uploading.
+- Set explicit S3 `ContentType` values for all media and workflow sidecars,
+  using source extensions for existing files and a binary fallback for unknown
+  formats. Previously uploaded objects are unchanged.
+- Added real audio encoding/independent decoding tests and corrected three
+  existing tuple-return assertions in the regression suite.
+
 ## 0.4.1
 
 - Moved workflow provenance sidecars into a dedicated `workflows/` child

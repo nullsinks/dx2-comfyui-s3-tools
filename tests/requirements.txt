@@ -1,0 +1,7 @@
+-r ../requirements.txt
+pytest
+numpy
+Pillow
+av>=17.0.0
+torch
+soundfile

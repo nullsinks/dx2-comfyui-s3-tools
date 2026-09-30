@@ -224,7 +224,7 @@ class TestUploadMedia(unittest.TestCase):
             result,
             (
                 "s3://test-bucket/videos/minimax-h3/"
-                f"test-{self.FIXED_TIMESTAMP}.mp4"
+                f"test-{self.FIXED_TIMESTAMP}.mp4",
             ),
         )
 
@@ -247,6 +247,7 @@ class TestUploadMedia(unittest.TestCase):
             "/tmp/my.mp4",
             "test-bucket",
             f"videos/wan2.2/test-{self.FIXED_TIMESTAMP}.mp4",
+            ExtraArgs={"ContentType": "video/mp4"},
         )
 
     def test_workflow_sidecar_is_enabled_by_default_and_preserves_metadata(self):
@@ -262,7 +263,7 @@ class TestUploadMedia(unittest.TestCase):
         }
         captured = {}
 
-        def capture_upload(path, bucket, key):
+        def capture_upload(path, bucket, key, **kwargs):
             if key.endswith(".workflow.json"):
                 with open(path, encoding="utf-8") as sidecar:
                     captured["payload"] = json.load(sidecar)
@@ -322,7 +323,7 @@ class TestUploadMedia(unittest.TestCase):
     def test_missing_workflow_metadata_is_written_as_null(self):
         captured = {}
 
-        def capture_upload(path, bucket, key):
+        def capture_upload(path, bucket, key, **kwargs):
             if key.endswith(".workflow.json"):
                 with open(path, encoding="utf-8") as sidecar:
                     captured.update(json.load(sidecar))
@@ -424,7 +425,7 @@ class TestUploadMedia(unittest.TestCase):
             result,
             (
                 "s3://test-bucket/videos/wan2.2/"
-                f"test-{self.FIXED_TIMESTAMP}.mp4"
+                f"test-{self.FIXED_TIMESTAMP}.mp4",
             ),
         )
 
@@ -501,12 +502,13 @@ class TestUploadMedia(unittest.TestCase):
             temporary_path,
             "test-bucket",
             f"videos/minimax-h3/test-{self.FIXED_TIMESTAMP}.mp4",
+            ExtraArgs={"ContentType": "video/mp4"},
         )
         self.assertEqual(
             result,
             (
                 "s3://test-bucket/videos/minimax-h3/"
-                f"test-{self.FIXED_TIMESTAMP}.mp4"
+                f"test-{self.FIXED_TIMESTAMP}.mp4",
             ),
         )
         self.assertFalse(os.path.exists(temporary_path))
@@ -646,7 +648,7 @@ class TestUploadMedia(unittest.TestCase):
     def test_image_batch_uploads_one_workflow_sidecar_per_image(self):
         payloads = []
 
-        def capture_upload(path, bucket, key):
+        def capture_upload(path, bucket, key, **kwargs):
             if key.endswith(".workflow.json"):
                 with open(path, encoding="utf-8") as sidecar:
                     payloads.append(json.load(sidecar))

@@ -4,7 +4,7 @@ DX2 ComfyUI S3 Tools – nodes.py
 Provides:
   DX2UploadMediaToS3 – uploads generated media to an S3-compatible bucket.
 
-The node accepts ComfyUI's native IMAGE or VIDEO type, a plain STRING file
+The node accepts ComfyUI's native IMAGE, VIDEO, or AUDIO type, a plain STRING file
 path, or the VHS_FILENAMES output of ComfyUI-VideoHelperSuite's VideoCombine
 node.
 
@@ -21,9 +21,12 @@ Optional environment variables:
 import json
 import os
 import logging
+import mimetypes
 import re
 import tempfile
 from datetime import datetime, timezone
+from fractions import Fraction
+from numbers import Integral
 from pathlib import Path, PurePosixPath
 
 import boto3
@@ -40,11 +43,12 @@ class DX2UploadMediaToS3:
     --------------
     - Connect any ComfyUI IMAGE output to *image*.
     - Connect the VIDEO output of ComfyUI's CreateVideo to *video*.
+    - Connect a decoded AUDIO output to *audio* for 24-bit FLAC uploads.
     - Connect a plain file-path string to *local_path*.
     - Connect the VHS_FILENAMES output of VHS_VideoCombine to *vhs_filenames*
       (the last file in the list is used).
     - All source inputs are optional individually; at least one must be provided.
-      Priority is *image*, then *video*, then *local_path*, then
+      Priority is *image*, then *video*, then *audio*, then *local_path*, then
       *vhs_filenames*.
     """
 
@@ -72,6 +76,8 @@ class DX2UploadMediaToS3:
                 ),
                 "enabled": ("BOOLEAN", {"default": True}),
                 "upload_workflow": ("BOOLEAN", {"default": True}),
+                # Append new inputs to preserve existing workflow socket indices.
+                "audio": ("AUDIO",),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -101,6 +107,7 @@ class DX2UploadMediaToS3:
         image=None,
         prompt=None,
         extra_pnginfo=None,
+        audio=None,
     ):
         """Upload media to S3 and return destination information.
 
@@ -129,6 +136,9 @@ class DX2UploadMediaToS3:
         image:
             Native ComfyUI IMAGE tensor. Each batch item is serialized to a
             temporary PNG, which is removed after the upload attempt.
+        audio:
+            Native ComfyUI AUDIO payload. Each mono/stereo batch item is
+            serialized to a temporary 24-bit FLAC at its original sample rate.
         """
         if not enabled:
             logger.info("DX2UploadMediaToS3: upload disabled – skipping.")
@@ -140,9 +150,11 @@ class DX2UploadMediaToS3:
             # 1. Resolve or materialize the local file path
             # --------------------------------------------------------------
             is_image_upload = image is not None
+            forced_suffix = None
             if is_image_upload:
                 resolved_paths = self._materialize_images(image, temporary_paths)
                 resolved_path = resolved_paths[0]
+                forced_suffix = ".png"
             elif video is not None:
                 file_descriptor, temporary_path = tempfile.mkstemp(suffix=".mp4")
                 os.close(file_descriptor)
@@ -150,6 +162,9 @@ class DX2UploadMediaToS3:
                 video.save_to(temporary_path)
                 resolved_path = temporary_path
                 resolved_paths = [resolved_path]
+            elif audio is not None:
+                resolved_paths = self._materialize_audio(audio, temporary_paths)
+                forced_suffix = ".flac"
             else:
                 resolved_path = self._resolve_path(local_path, vhs_filenames)
                 resolved_paths = [resolved_path]
@@ -191,13 +206,13 @@ class DX2UploadMediaToS3:
             )
             normalized_s3_path = self._normalize_s3_path(s3_path)
             upload_jobs = []
-            is_batch = is_image_upload and len(resolved_paths) > 1
+            is_batch = len(resolved_paths) > 1
             for index, resolved_path in enumerate(resolved_paths):
                 filename = self._build_destination_filename(
                     source_path=resolved_path,
                     requested_name=file_name,
                     timestamp=timestamp,
-                    forced_suffix=".png" if is_image_upload else None,
+                    forced_suffix=forced_suffix,
                     batch_index=index if is_batch else None,
                 )
                 s3_key = f"{normalized_s3_path}/{filename}"
@@ -293,7 +308,8 @@ class DX2UploadMediaToS3:
 
         raise ValueError(
             "DX2UploadMediaToS3: no media provided. "
-            "Connect image (IMAGE), video (VIDEO), local_path (STRING), or "
+            "Connect image (IMAGE), video (VIDEO), audio (AUDIO), "
+            "local_path (STRING), or "
             "vhs_filenames (VHS_FILENAMES)."
         )
 
@@ -339,6 +355,97 @@ class DX2UploadMediaToS3:
             Image.fromarray(image_array).save(temporary_path, format="PNG")
             resolved_paths.append(temporary_path)
 
+        return resolved_paths
+
+    @staticmethod
+    def _materialize_audio(audio, temporary_paths) -> list[str]:
+        """Serialize AUDIO batches to 24-bit FLAC without resampling or gain changes."""
+        if not isinstance(audio, dict) or not {"waveform", "sample_rate"} <= audio.keys():
+            raise ValueError(
+                "DX2UploadMediaToS3: audio must contain waveform and sample_rate."
+            )
+
+        sample_rate = audio["sample_rate"]
+        # FLAC frame headers support sample rates up to 655350 Hz.
+        if (
+            isinstance(sample_rate, bool)
+            or not isinstance(sample_rate, Integral)
+            or not 1 <= sample_rate <= 655350
+        ):
+            raise ValueError(
+                "DX2UploadMediaToS3: audio sample_rate must be an integer "
+                "between 1 and 655350 Hz (FLAC limit)."
+            )
+        sample_rate = int(sample_rate)
+
+        # These libraries ship with current ComfyUI. Keep them lazy so other
+        # input types still work on runtimes without native audio support.
+        try:
+            import av
+            import numpy as np
+            import torch
+        except ImportError as exc:
+            raise RuntimeError(
+                "DX2UploadMediaToS3: native audio requires PyAV (av), NumPy, "
+                "and PyTorch from the ComfyUI runtime."
+            ) from exc
+
+        waveform = audio["waveform"]
+        if not isinstance(waveform, torch.Tensor) or not waveform.is_floating_point():
+            raise ValueError(
+                "DX2UploadMediaToS3: audio waveform must be a floating-point tensor."
+            )
+        if waveform.ndim != 3:
+            raise ValueError(
+                "DX2UploadMediaToS3: audio waveform must have shape "
+                "[batch, channels, samples]."
+            )
+        if any(dimension == 0 for dimension in waveform.shape):
+            raise ValueError("DX2UploadMediaToS3: audio waveform is empty.")
+        if waveform.shape[1] not in (1, 2):
+            raise ValueError("DX2UploadMediaToS3: audio must be mono or stereo.")
+
+        layout = "mono" if waveform.shape[1] == 1 else "stereo"
+        resolved_paths = []
+        chunk_size = 65536
+        for batch_index, track in enumerate(waveform):
+            descriptor, temporary_path = tempfile.mkstemp(suffix=".flac")
+            os.close(descriptor)
+            temporary_paths.append(temporary_path)
+            with av.open(temporary_path, mode="w", format="flac") as container:
+                stream = container.add_stream("flac", rate=sample_rate)
+                stream.layout = layout
+                # FLAC uses s32 frames for 24-bit samples. Explicit precision
+                # avoids PyAV's default s16 encoding and future default changes.
+                stream.format = "s32"
+                stream.codec_context.options = {"bits_per_raw_sample": "24"}
+                for start in range(0, track.shape[-1], chunk_size):
+                    samples = (
+                        track[:, start : start + chunk_size]
+                        .detach()
+                        .cpu()
+                        .double()
+                        .numpy()
+                    )
+                    if not np.isfinite(samples).all():
+                        raise ValueError(
+                            f"DX2UploadMediaToS3: audio track {batch_index + 1} "
+                            "contains nonfinite samples."
+                        )
+                    if np.any(samples < -1.0) or np.any(samples > 1.0):
+                        raise ValueError(
+                            f"DX2UploadMediaToS3: audio track {batch_index + 1} "
+                            "exceeds [-1, 1] and would clip. Adjust levels upstream."
+                        )
+                    frame = av.AudioFrame.from_ndarray(
+                        np.ascontiguousarray(samples), format="dblp", layout=layout
+                    )
+                    frame.sample_rate = sample_rate
+                    frame.time_base = Fraction(1, sample_rate)
+                    frame.pts = start
+                    container.mux(stream.encode(frame))
+                container.mux(stream.encode(None))
+            resolved_paths.append(temporary_path)
         return resolved_paths
 
     @staticmethod
@@ -453,6 +560,46 @@ class DX2UploadMediaToS3:
         return boto3.client("s3", **client_kwargs)
 
     @staticmethod
+    def _content_type(local_path: str) -> str:
+        """Use the source format, never a user-renamed destination extension."""
+        media_types = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+            ".gif": "image/gif",
+            ".avif": "image/avif",
+            ".bmp": "image/bmp",
+            ".tif": "image/tiff",
+            ".tiff": "image/tiff",
+            ".mp4": "video/mp4",
+            ".m4v": "video/mp4",
+            ".webm": "video/webm",
+            ".mov": "video/quicktime",
+            ".mkv": "video/x-matroska",
+            ".avi": "video/x-msvideo",
+            ".flac": "audio/flac",
+            ".wav": "audio/wav",
+            ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
+            ".aac": "audio/aac",
+            ".ogg": "audio/ogg",
+            ".oga": "audio/ogg",
+            ".opus": "audio/ogg",
+            ".aif": "audio/aiff",
+            ".aiff": "audio/aiff",
+            ".json": "application/json",
+        }
+        suffix = Path(local_path).suffix.lower()
+        if suffix in media_types:
+            return media_types[suffix]
+        content_type, encoding = mimetypes.guess_type(str(local_path))
+        # Do not label compressed bytes as their uncompressed inner format.
+        if content_type and not encoding:
+            return content_type
+        return "application/octet-stream"
+
+    @staticmethod
     def _upload(
         s3_client,
         local_path: str,
@@ -467,7 +614,12 @@ class DX2UploadMediaToS3:
         S3 failure surfaces as a ``RuntimeError`` with bucket/key context.
         """
         try:
-            s3_client.upload_file(local_path, bucket, s3_key)
+            s3_client.upload_file(
+                local_path,
+                bucket,
+                s3_key,
+                ExtraArgs={"ContentType": DX2UploadMediaToS3._content_type(local_path)},
+            )
         except (ClientError, S3UploadFailedError) as exc:
             raise RuntimeError(
                 f"DX2UploadMediaToS3: upload failed for "
