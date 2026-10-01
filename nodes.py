@@ -139,6 +139,7 @@ class DX2UploadMediaToS3:
         audio:
             Native ComfyUI AUDIO payload. Each mono/stereo batch item is
             serialized to a temporary 24-bit FLAC at its original sample rate.
+            Out-of-range samples are clamped; affected filenames end in -clipped.
         """
         if not enabled:
             logger.info("DX2UploadMediaToS3: upload disabled – skipping.")
@@ -151,6 +152,7 @@ class DX2UploadMediaToS3:
             # --------------------------------------------------------------
             is_image_upload = image is not None
             forced_suffix = None
+            clipped_audio_paths = set()
             if is_image_upload:
                 resolved_paths = self._materialize_images(image, temporary_paths)
                 resolved_path = resolved_paths[0]
@@ -163,7 +165,7 @@ class DX2UploadMediaToS3:
                 resolved_path = temporary_path
                 resolved_paths = [resolved_path]
             elif audio is not None:
-                resolved_paths = self._materialize_audio(audio, temporary_paths)
+                resolved_paths, clipped_audio_paths = self._materialize_audio(audio, temporary_paths)
                 forced_suffix = ".flac"
             else:
                 resolved_path = self._resolve_path(local_path, vhs_filenames)
@@ -215,6 +217,8 @@ class DX2UploadMediaToS3:
                     forced_suffix=forced_suffix,
                     batch_index=index if is_batch else None,
                 )
+                if resolved_path in clipped_audio_paths:
+                    filename = f"{Path(filename).stem}-clipped{Path(filename).suffix}"
                 s3_key = f"{normalized_s3_path}/{filename}"
                 upload_jobs.append((resolved_path, s3_key, index))
 
@@ -358,8 +362,8 @@ class DX2UploadMediaToS3:
         return resolved_paths
 
     @staticmethod
-    def _materialize_audio(audio, temporary_paths) -> list[str]:
-        """Serialize AUDIO batches to 24-bit FLAC without resampling or gain changes."""
+    def _materialize_audio(audio, temporary_paths) -> tuple[list[str], set[str]]:
+        """Encode AUDIO as 24-bit FLAC; report paths with clamped finite samples."""
         if not isinstance(audio, dict) or not {"waveform", "sample_rate"} <= audio.keys():
             raise ValueError(
                 "DX2UploadMediaToS3: audio must contain waveform and sample_rate."
@@ -407,8 +411,11 @@ class DX2UploadMediaToS3:
 
         layout = "mono" if waveform.shape[1] == 1 else "stereo"
         resolved_paths = []
+        clipped_paths = set()
         chunk_size = 65536
         for batch_index, track in enumerate(waveform):
+            peak = 0.0
+            clipped_samples = 0
             descriptor, temporary_path = tempfile.mkstemp(suffix=".flac")
             os.close(descriptor)
             temporary_paths.append(temporary_path)
@@ -432,11 +439,13 @@ class DX2UploadMediaToS3:
                             f"DX2UploadMediaToS3: audio track {batch_index + 1} "
                             "contains nonfinite samples."
                         )
-                    if np.any(samples < -1.0) or np.any(samples > 1.0):
-                        raise ValueError(
-                            f"DX2UploadMediaToS3: audio track {batch_index + 1} "
-                            "exceeds [-1, 1] and would clip. Adjust levels upstream."
-                        )
+                    peak = max(peak, float(np.abs(samples).max()))
+                    chunk_clipped = int(np.count_nonzero((samples < -1.0) | (samples > 1.0)))
+                    clipped_samples += chunk_clipped
+                    if chunk_clipped:
+                        # Allocate a new array: CPU float64 tensors may share
+                        # memory with samples, so never clamp it in place.
+                        samples = np.clip(samples, -1.0, 1.0)
                     frame = av.AudioFrame.from_ndarray(
                         np.ascontiguousarray(samples), format="dblp", layout=layout
                     )
@@ -445,8 +454,15 @@ class DX2UploadMediaToS3:
                     frame.pts = start
                     container.mux(stream.encode(frame))
                 container.mux(stream.encode(None))
+            if clipped_samples:
+                clipped_paths.add(temporary_path)
+                logger.warning(
+                    "DX2UploadMediaToS3: audio track %d clamped to [-1, 1]; "
+                    "original peak=%s, clipped samples=%d/%d; filename marked -clipped",
+                    batch_index + 1, peak, clipped_samples, track.numel(),
+                )
             resolved_paths.append(temporary_path)
-        return resolved_paths
+        return resolved_paths, clipped_paths
 
     @staticmethod
     def _build_sidecar_key(media_s3_key: str) -> str:

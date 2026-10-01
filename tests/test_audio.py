@@ -140,8 +140,7 @@ def test_audio_batch_names_sidecars_and_last_uri(upload, temporary_audio_paths):
     (audio(torch.zeros(1, 3, 16)), "mono or stereo"),
     (audio(torch.full((1, 2, 16), float("nan"))), "nonfinite"),
     (audio(torch.full((1, 2, 16), float("inf"))), "nonfinite"),
-    (audio(torch.full((1, 2, 16), 1.01)), "would clip"),
-    (audio(torch.full((1, 2, 16), -1.01)), "would clip"),
+    (audio(torch.full((1, 2, 16), -float("inf"))), "nonfinite"),
 ])
 def test_invalid_audio_never_uploads(upload, temporary_audio_paths, payload, match):
     node, client, _ = upload
@@ -153,11 +152,71 @@ def test_invalid_audio_never_uploads(upload, temporary_audio_paths, payload, mat
 def test_late_invalid_audio_cleans_all_encoded_files(upload, temporary_audio_paths):
     node, client, _ = upload
     waveform = torch.zeros(2, 2, 65537)
-    waveform[1, 0, -1] = 1.5
-    with pytest.raises(ValueError, match="track 2.*would clip"):
+    waveform[0, 0, 0] = 1.5
+    waveform[1, 0, -1] = float("nan")
+    with pytest.raises(ValueError, match="track 2.*nonfinite"):
         node.upload_media(audio=audio(waveform))
     assert len(temporary_audio_paths) == 2
     client.upload_file.assert_not_called()
+
+
+@pytest.mark.parametrize("channels", [1, 2])
+def test_clipped_batch_marks_only_affected_tracks_and_preserves_audio(
+    upload, temporary_audio_paths, caplog, channels
+):
+    node, _, captured = upload
+    count = 65539
+    waveform = torch.full((3, channels, count), 0.25, dtype=torch.float64)
+    waveform[0, :, 0] = -1.0
+    waveform[0, :, 1] = 1.0
+    waveform[1, :, 0] = 1.25
+    waveform[1, :, -1] = 1.5  # clipped samples span encoding chunks
+    waveform[2, :, -1] = -2.0
+    waveform.requires_grad_()
+    original = waveform.detach().clone()
+
+    result = node.upload_media(
+        audio=audio(waveform), s3_path="music/yue2", file_name="song.mp3",
+        prompt={"44": {"class_type": "DX2UploadMediaToS3"}},
+    )
+
+    assert len(captured) == 6
+    for index in range(3):
+        _, key, headers, data = captured[index * 2]
+        _, sidecar_key, _, sidecar = captured[index * 2 + 1]
+        marker = "-clipped" if index else ""
+        assert key.startswith("music/yue2/song-")
+        assert key.endswith(f"-{index + 1:04d}{marker}.flac")
+        assert headers == {"ContentType": "audio/flac"}
+        assert sidecar_key == f"music/yue2/workflows/{Path(key).stem}.workflow.json"
+        media = json.loads(sidecar)["media"]
+        assert media["filename"] == Path(key).name
+        assert media["s3_uri"] == f"s3://test-bucket/{key}"
+        info = sf.info(io.BytesIO(data))
+        assert (info.subtype, info.channels, info.frames, info.samplerate) == (
+            "PCM_24", channels, count, 48000
+        )
+        decoded, _ = sf.read(io.BytesIO(data), dtype="float64", always_2d=True)
+        expected = original[index].clamp(-1, 1).numpy().T
+        np.testing.assert_allclose(decoded, expected, atol=2**-23, rtol=0)
+    assert result == (f"s3://test-bucket/{captured[4][1]}",)
+    assert torch.equal(waveform, original)
+    assert waveform.requires_grad
+    assert "audio track 1 clamped" not in caplog.text
+    assert f"original peak=1.5, clipped samples={2 * channels}/{count * channels}" in caplog.text
+    assert f"original peak=2.0, clipped samples={channels}/{count * channels}" in caplog.text
+
+
+@pytest.mark.parametrize("file_name", ["", "song.wav"])
+def test_single_clipped_track_name_and_uri(upload, temporary_audio_paths, file_name):
+    node, _, captured = upload
+    result = node.upload_media(
+        audio=audio(torch.tensor([[[-1.01, 0.5, 1.01]]], dtype=torch.float64)),
+        file_name=file_name, upload_workflow=False,
+    )
+    assert len(captured) == 1
+    assert captured[0][1].endswith("-clipped.flac")
+    assert result == (f"s3://test-bucket/{captured[0][1]}",)
 
 
 def test_disabled_audio_does_not_import_or_encode(upload):

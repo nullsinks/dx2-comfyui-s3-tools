@@ -36,7 +36,15 @@ Native audio is encoded with PyAV as 24-bit FLAC, preserving the original sample
 rate and mono/stereo layout. An extension in `file_name` is ignored for native
 audio. Multi-track batches produce separate, sequentially numbered FLAC files.
 The uploader does not normalize, resample, or downmix audio. Samples outside
-`[-1, 1]` are rejected with a clipping-risk error; adjust their levels upstream.
+`[-1, 1]` are clamped to that range before encoding. Affected tracks are uploaded
+with `-clipped` immediately before `.flac`, for example
+`song-20261001T120000_000000Z-clipped.flac`. Their workflow sidecars use the same
+marked stem. In a batch, only affected tracks receive the marker, after their
+batch number. The warning log reports each affected track's original absolute
+peak and clipped sample count (counting each channel separately). In-range tracks
+keep their existing naming and encoding. NaN and infinite samples still fail
+before any S3 upload. The marker flags real clipping in the saved audio, not
+peak normalization or preservation of the over-range waveform.
 FLAC compression is lossless, while conversion from floating-point samples to
 24-bit PCM introduces quantization. Input tensors are never modified.
 
@@ -248,7 +256,8 @@ workflows may omit `upload_workflow` and inherit `true`; set it explicitly to
 |---|---|
 | No media source | Raises `ValueError` describing the supported inputs. |
 | Invalid or empty IMAGE batch | Raises `ValueError` before contacting S3. |
-| Invalid AUDIO, unsupported channels, nonfinite samples, or clipping risk | Raises `ValueError` before contacting S3. All generated temporary files are removed. |
+| Invalid AUDIO, unsupported channels, or nonfinite samples | Raises `ValueError` before contacting S3. All generated temporary files are removed. |
+| Finite AUDIO samples outside `[-1, 1]` | Clamps and uploads as `*-clipped.flac`, with a matching workflow sidecar and a warning containing the original peak and clipped sample count. |
 | Missing native-audio dependencies | Raises an audio-specific `RuntimeError`; other source types remain usable. |
 | File not found | Raises `FileNotFoundError` with the resolved path. |
 | Missing credentials | Raises `EnvironmentError` naming the missing configuration. |
