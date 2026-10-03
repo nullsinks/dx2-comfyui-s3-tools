@@ -13,11 +13,14 @@
   the single-URI return contract are preserved.
 - Reused media naming, per-track workflow sidecars, and temporary-file cleanup
   for audio. Invalid audio and nonfinite samples fail before uploading.
-- Finite out-of-range audio is now clamped and uploaded with `-clipped` appended
-  before `.flac`. Matching workflow sidecars retain the marker; warning logs
-  report the original peak and clipped sample count per affected track. Clean
-  tracks and input tensors are unchanged. Real FLAC decoding tests cover mixed
-  batches, chunk boundaries, naming, and cleanup after late nonfinite samples.
+- Finite out-of-range audio produces both `-clipped.flac` and
+  `-gain-reduced.flac` directly from the original waveform. The reduced version
+  uses one constant gain across channels to target a -1 dBFS sample peak.
+  Variants share their timestamp and source batch index; matching sidecars
+  record peaks, sample counts, gain, and processing variant. Warning logs
+  report the original peak, clipped count, and reduced gain. Clean tracks and
+  input tensors are unchanged. Real FLAC decoding tests cover mixed batches,
+  stereo balance, chunk boundaries, metadata, and failure cleanup.
 - Set explicit S3 `ContentType` values for all media and workflow sidecars,
   using source extensions for existing files and a binary fallback for unknown
   formats. Previously uploaded objects are unchanged.

@@ -172,6 +172,8 @@ def test_clipped_batch_marks_only_affected_tracks_and_preserves_audio(
     waveform[1, :, 0] = 1.25
     waveform[1, :, -1] = 1.5  # clipped samples span encoding chunks
     waveform[2, :, -1] = -2.0
+    if channels == 2:
+        waveform[:, 1] *= 0.5  # a shared gain must preserve stereo balance
     waveform.requires_grad_()
     original = waveform.detach().clone()
 
@@ -180,31 +182,53 @@ def test_clipped_batch_marks_only_affected_tracks_and_preserves_audio(
         prompt={"44": {"class_type": "DX2UploadMediaToS3"}},
     )
 
-    assert len(captured) == 6
-    for index in range(3):
-        _, key, headers, data = captured[index * 2]
-        _, sidecar_key, _, sidecar = captured[index * 2 + 1]
-        marker = "-clipped" if index else ""
+    assert len(captured) == 10
+    variants = [(0, "original"), (1, "clipped"), (1, "gain-reduced"),
+                (2, "clipped"), (2, "gain-reduced")]
+    timestamp_stems = set()
+    for output_index, (index, variant) in enumerate(variants):
+        _, key, headers, data = captured[output_index * 2]
+        _, sidecar_key, _, sidecar = captured[output_index * 2 + 1]
+        marker = "" if variant == "original" else f"-{variant}"
         assert key.startswith("music/yue2/song-")
         assert key.endswith(f"-{index + 1:04d}{marker}.flac")
+        timestamp_stems.add(key.removesuffix(f"-{index + 1:04d}{marker}.flac"))
         assert headers == {"ContentType": "audio/flac"}
         assert sidecar_key == f"music/yue2/workflows/{Path(key).stem}.workflow.json"
         media = json.loads(sidecar)["media"]
         assert media["filename"] == Path(key).name
         assert media["s3_uri"] == f"s3://test-bucket/{key}"
+        assert media["batch_index"] == index + 1
+        assert media["batch_count"] == 3
+        peak = original[index].abs().max().item()
+        gain = 10 ** (-1 / 20) / peak if variant == "gain-reduced" else 1.0
+        processing = media["audio_processing"]
+        over_range = int((original[index].abs() > 1).sum())
+        assert processing == {
+            "variant": variant, "original_peak": peak,
+            "original_out_of_range_samples": over_range,
+            "sample_count": count * channels, "gain": gain,
+            "gain_db": pytest.approx(20 * np.log10(gain)),
+            "target_peak_dbfs": -1.0 if variant == "gain-reduced" else None,
+            "clipped_samples": over_range if variant == "clipped" else 0,
+        }
         info = sf.info(io.BytesIO(data))
         assert (info.subtype, info.channels, info.frames, info.samplerate) == (
             "PCM_24", channels, count, 48000
         )
         decoded, _ = sf.read(io.BytesIO(data), dtype="float64", always_2d=True)
-        expected = original[index].clamp(-1, 1).numpy().T
+        expected = (original[index].clamp(-1, 1) if variant == "clipped"
+                    else original[index] * gain).numpy().T
         np.testing.assert_allclose(decoded, expected, atol=2**-23, rtol=0)
-    assert result == (f"s3://test-bucket/{captured[4][1]}",)
+        if variant == "gain-reduced":
+            assert np.abs(decoded).max() == pytest.approx(10 ** (-1 / 20), abs=2**-23)
+    assert len(timestamp_stems) == 1
+    assert result == (f"s3://test-bucket/{captured[8][1]}",)
     assert torch.equal(waveform, original)
     assert waveform.requires_grad
     assert "audio track 1 clamped" not in caplog.text
-    assert f"original peak=1.5, clipped samples={2 * channels}/{count * channels}" in caplog.text
-    assert f"original peak=2.0, clipped samples={channels}/{count * channels}" in caplog.text
+    assert f"original peak=1.5, clipped samples=2/{count * channels}" in caplog.text
+    assert f"original peak=2.0, clipped samples=1/{count * channels}" in caplog.text
 
 
 @pytest.mark.parametrize("file_name", ["", "song.wav"])
@@ -214,9 +238,65 @@ def test_single_clipped_track_name_and_uri(upload, temporary_audio_paths, file_n
         audio=audio(torch.tensor([[[-1.01, 0.5, 1.01]]], dtype=torch.float64)),
         file_name=file_name, upload_workflow=False,
     )
-    assert len(captured) == 1
+    assert len(captured) == 2
     assert captured[0][1].endswith("-clipped.flac")
-    assert result == (f"s3://test-bucket/{captured[0][1]}",)
+    assert captured[1][1] == captured[0][1].replace("-clipped.flac", "-gain-reduced.flac")
+    assert result == (f"s3://test-bucket/{captured[1][1]}",)
+
+
+@pytest.mark.parametrize("embed", [False, True])
+def test_both_variants_preserve_metadata_controls(upload, temporary_audio_paths, embed):
+    import av
+
+    node, _, captured = upload
+    prompt = {"44": {"class_type": "DX2UploadMediaToS3"}}
+    workflow = {"nodes": []}
+    node.upload_media(
+        audio=audio(torch.tensor([[[0.5, 1.2, -1.5]]])), prompt=prompt,
+        extra_pnginfo={"workflow": workflow}, embed_metadata=embed,
+    )
+    assert len(captured) == 4
+    for index in (0, 2):
+        with av.open(io.BytesIO(captured[index][3])) as container:
+            tags = container.metadata
+            assert ("prompt" in tags) == embed
+            assert ("workflow" in tags) == embed
+            if embed:
+                assert json.loads(tags["prompt"]) == prompt
+                assert json.loads(tags["workflow"]) == workflow
+        sidecar = json.loads(captured[index + 1][3])
+        assert sidecar["comfyui"]["prompt"] == prompt
+        assert sidecar["comfyui"]["workflow"] == workflow
+
+
+def test_second_variant_encoding_failure_uploads_nothing(upload, temporary_audio_paths):
+    import av
+
+    node, client, _ = upload
+    real_open = av.open
+    calls = 0
+
+    def fail_second(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise RuntimeError("second variant failed")
+        return real_open(*args, **kwargs)
+
+    with patch("av.open", side_effect=fail_second):
+        with pytest.raises(RuntimeError, match="second variant failed"):
+            node.upload_media(audio=audio(torch.full((1, 2, 16), 1.2)))
+    assert len(temporary_audio_paths) == 2
+    client.upload_file.assert_not_called()
+
+
+def test_second_variant_upload_failure_cleans_both_files(upload, temporary_audio_paths):
+    node, client, _ = upload
+    client.upload_file.side_effect = [None, S3UploadFailedError("connection lost")]
+    with pytest.raises(RuntimeError, match="upload failed for s3://test-bucket/.*gain-reduced"):
+        node.upload_media(audio=audio(torch.full((1, 1, 16), 1.2)), upload_workflow=False)
+    assert client.upload_file.call_count == 2
+    assert len(temporary_audio_paths) == 2
 
 
 def test_disabled_audio_does_not_import_or_encode(upload):

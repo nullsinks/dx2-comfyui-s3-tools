@@ -36,16 +36,29 @@ numbered PNG files.
 Native audio is encoded with PyAV as 24-bit FLAC, preserving the original sample
 rate and mono/stereo layout. An extension in `file_name` is ignored for native
 audio. Multi-track batches produce separate, sequentially numbered FLAC files.
-The uploader does not normalize, resample, or downmix audio. Samples outside
-`[-1, 1]` are clamped to that range before encoding. Affected tracks are uploaded
-with `-clipped` immediately before `.flac`, for example
-`song-20261001T120000_000000Z-clipped.flac`. Their workflow sidecars use the same
-marked stem. In a batch, only affected tracks receive the marker, after their
-batch number. The warning log reports each affected track's original absolute
-peak and clipped sample count (counting each channel separately). In-range tracks
-keep their existing naming and encoding. NaN and infinite samples still fail
-before any S3 upload. The marker flags real clipping in the saved audio, not
-peak normalization or preservation of the over-range waveform.
+Only tracks with samples outside `[-1, 1]` produce two versions:
+
+- `song-<timestamp>-clipped.flac`: samples are hard-clamped to `[-1, 1]`.
+- `song-<timestamp>-gain-reduced.flac`: the original waveform is multiplied by
+  one constant gain, `10^(-1/20) / original_peak`, across all channels and samples.
+  This preserves dynamics and stereo balance while reducing the sample peak to
+  -1 dBFS. It is not a true-peak limiter and cannot undo distortion already
+  present in the generated waveform.
+
+Both versions are encoded directly from the original waveform and share a
+timestamp and source batch number. Each receives its own matching workflow
+sidecar. Sidecar `media.audio_processing` records `variant`, `original_peak`,
+`original_out_of_range_samples`, `sample_count`, `gain`, `gain_db`,
+`target_peak_dbfs`, and `clipped_samples`. Counts include each channel separately;
+`batch_index` and `batch_count` describe source tracks, not exported variants.
+Warning logs report the original peak, clipped sample count, and applied gain.
+
+In-range tracks, including silence and peaks between -1 dBFS and full scale,
+produce one unchanged, normally named file. Audio is never resampled or downmixed.
+NaN and infinite samples fail before any S3 upload.
+The single-URI output returns the last uploaded media file: the gain-reduced
+version if the final source track is over range. Find both versions by their
+shared filename prefix in S3.
 FLAC compression is lossless, while conversion from floating-point samples to
 24-bit PCM introduces quantization. Input tensors are never modified.
 
@@ -85,8 +98,8 @@ Portable tag names must be 1–79 printable ASCII characters, excluding `=`, wit
 no leading, trailing, or consecutive spaces.
 
 Embedding uses the existing encoding step and does not change image pixels,
-audio precision, sample rate, or video encoding settings. There is no second
-encoding pass. Existing `local_path` and VHS files are uploaded byte-for-byte,
+audio precision, sample rate, or video encoding settings. Each audio variant is
+encoded once from the source waveform. Existing `local_path` and VHS files are uploaded byte-for-byte,
 including whatever metadata their original saver wrote.
 
 Set `embed_metadata=false` or start ComfyUI with `--disable-metadata` to stop
@@ -261,7 +274,8 @@ VAE Decode Audio / audio processor -> audio -> DX2UploadMediaToS3
 PyAV writes temporary FLAC files, which follow the same S3 naming, upload,
 workflow-sidecar, and cleanup path as other media. Files are encoded in chunks
 to bound additional conversion memory. For a batch, all tracks are materialized
-before uploading, so temporary disk usage grows with batch size. Keep the
+before uploading, so temporary disk usage grows with batch size and doubles
+for tracks needing both versions. Keep the
 default `s3_path="media"` or choose any folder such as `audio/yue2`.
 
 ### VideoHelperSuite
@@ -303,7 +317,7 @@ workflows may omit `upload_workflow` and inherit `true`; set it explicitly to
 | No media source | Raises `ValueError` describing the supported inputs. |
 | Invalid or empty IMAGE batch | Raises `ValueError` before contacting S3. |
 | Invalid AUDIO, unsupported channels, or nonfinite samples | Raises `ValueError` before contacting S3. All generated temporary files are removed. |
-| Finite AUDIO samples outside `[-1, 1]` | Clamps and uploads as `*-clipped.flac`, with a matching workflow sidecar and a warning containing the original peak and clipped sample count. |
+| Finite AUDIO samples outside `[-1, 1]` | Uploads both `*-clipped.flac` and `*-gain-reduced.flac` from the original waveform, with matching sidecars and processing details. The reduced version targets a -1 dBFS sample peak. |
 | Missing native-audio dependencies | Raises an audio-specific `RuntimeError`; other source types remain usable. |
 | File not found | Raises `FileNotFoundError` with the resolved path. |
 | Missing credentials | Raises `EnvironmentError` naming the missing configuration. |

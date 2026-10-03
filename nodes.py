@@ -21,6 +21,7 @@ Optional environment variables:
 import json
 import os
 import logging
+import math
 import mimetypes
 import re
 import tempfile
@@ -141,7 +142,7 @@ class DX2UploadMediaToS3:
         audio:
             Native ComfyUI AUDIO payload. Each mono/stereo batch item is
             serialized to a temporary 24-bit FLAC at its original sample rate.
-            Out-of-range samples are clamped; affected filenames end in -clipped.
+            Over-range tracks produce both -clipped and -gain-reduced variants.
         embed_metadata:
             Embed prompt and supplied workflow metadata in native PNG, MP4,
             and FLAC outputs, unless ComfyUI disables metadata globally.
@@ -158,7 +159,7 @@ class DX2UploadMediaToS3:
             # --------------------------------------------------------------
             is_image_upload = image is not None
             forced_suffix = None
-            clipped_audio_paths = set()
+            audio_details = {}
             metadata = {}
             if embed_metadata and (is_image_upload or video is not None or audio is not None):
                 metadata = self._build_embedded_metadata(prompt, extra_pnginfo)
@@ -178,7 +179,7 @@ class DX2UploadMediaToS3:
                 resolved_path = temporary_path
                 resolved_paths = [resolved_path]
             elif audio is not None:
-                resolved_paths, clipped_audio_paths = self._materialize_audio(
+                resolved_paths, audio_details = self._materialize_audio(
                     audio, temporary_paths, metadata
                 )
                 forced_suffix = ".flac"
@@ -223,8 +224,17 @@ class DX2UploadMediaToS3:
             )
             normalized_s3_path = self._normalize_s3_path(s3_path)
             upload_jobs = []
-            is_batch = len(resolved_paths) > 1
+            # Variants retain their source track's index, rather than becoming
+            # extra batch tracks or renumbering clean tracks in a mixed batch.
+            batch_count = (
+                next(iter(audio_details.values()))["batch_count"]
+                if audio_details else len(resolved_paths)
+            )
+            is_batch = batch_count > 1
             for index, resolved_path in enumerate(resolved_paths):
+                audio_detail = audio_details.get(resolved_path)
+                if audio_detail is not None:
+                    index = audio_detail["batch_index"]
                 filename = self._build_destination_filename(
                     source_path=resolved_path,
                     requested_name=file_name,
@@ -232,8 +242,10 @@ class DX2UploadMediaToS3:
                     forced_suffix=forced_suffix,
                     batch_index=index if is_batch else None,
                 )
-                if resolved_path in clipped_audio_paths:
-                    filename = f"{Path(filename).stem}-clipped{Path(filename).suffix}"
+                if audio_detail is not None:
+                    variant = audio_detail["processing"]["variant"]
+                    if variant != "original":
+                        filename = f"{Path(filename).stem}-{variant}{Path(filename).suffix}"
                 s3_key = f"{normalized_s3_path}/{filename}"
                 upload_jobs.append((resolved_path, s3_key, index))
 
@@ -262,11 +274,12 @@ class DX2UploadMediaToS3:
                             media_s3_uri=upload_info,
                             media_filename=PurePosixPath(s3_key).name,
                             batch_index=index + 1,
-                            batch_count=len(upload_jobs),
+                            batch_count=batch_count,
                             captured_at=timestamp,
                             prompt=prompt,
                             extra_pnginfo=extra_pnginfo,
                             temporary_paths=temporary_paths,
+                            audio_processing=audio_details.get(resolved_path, {}).get("processing"),
                         )
                         logger.info(
                             "DX2UploadMediaToS3: uploading workflow sidecar to "
@@ -418,8 +431,8 @@ class DX2UploadMediaToS3:
         return resolved_paths
 
     @staticmethod
-    def _materialize_audio(audio, temporary_paths, metadata=None) -> tuple[list[str], set[str]]:
-        """Encode AUDIO as 24-bit FLAC; report paths with clamped finite samples."""
+    def _materialize_audio(audio, temporary_paths, metadata=None) -> tuple[list[str], dict]:
+        """Encode clean tracks once, over-range tracks as two independent variants."""
         if not isinstance(audio, dict) or not {"waveform", "sample_rate"} <= audio.keys():
             raise ValueError(
                 "DX2UploadMediaToS3: audio must contain waveform and sample_rate."
@@ -467,60 +480,82 @@ class DX2UploadMediaToS3:
 
         layout = "mono" if waveform.shape[1] == 1 else "stereo"
         resolved_paths = []
-        clipped_paths = set()
+        audio_details = {}
         chunk_size = 65536
+        target_peak_dbfs = -1.0
+        target_peak = 10 ** (target_peak_dbfs / 20)
         for batch_index, track in enumerate(waveform):
-            peak = 0.0
-            clipped_samples = 0
-            descriptor, temporary_path = tempfile.mkstemp(suffix=".flac")
-            os.close(descriptor)
-            temporary_paths.append(temporary_path)
-            with av.open(temporary_path, mode="w", format="flac") as container:
-                for key, value in (metadata or {}).items():
-                    container.metadata[key] = json.dumps(value)
-                stream = container.add_stream("flac", rate=sample_rate)
-                stream.layout = layout
-                # FLAC uses s32 frames for 24-bit samples. Explicit precision
-                # avoids PyAV's default s16 encoding and future default changes.
-                stream.format = "s32"
-                stream.codec_context.options = {"bits_per_raw_sample": "24"}
+            def chunks():
                 for start in range(0, track.shape[-1], chunk_size):
-                    samples = (
-                        track[:, start : start + chunk_size]
-                        .detach()
-                        .cpu()
-                        .double()
-                        .numpy()
+                    yield start, track[:, start:start + chunk_size].detach().cpu().double().numpy()
+
+            # Scan the original track before encoding either variant. One peak
+            # and gain across all channels preserves the stereo balance.
+            peak = 0.0
+            over_range_samples = 0
+            for _, samples in chunks():
+                if not np.isfinite(samples).all():
+                    raise ValueError(
+                        f"DX2UploadMediaToS3: audio track {batch_index + 1} "
+                        "contains nonfinite samples."
                     )
-                    if not np.isfinite(samples).all():
-                        raise ValueError(
-                            f"DX2UploadMediaToS3: audio track {batch_index + 1} "
-                            "contains nonfinite samples."
-                        )
-                    peak = max(peak, float(np.abs(samples).max()))
-                    chunk_clipped = int(np.count_nonzero((samples < -1.0) | (samples > 1.0)))
-                    clipped_samples += chunk_clipped
-                    if chunk_clipped:
-                        # Allocate a new array: CPU float64 tensors may share
-                        # memory with samples, so never clamp it in place.
-                        samples = np.clip(samples, -1.0, 1.0)
-                    frame = av.AudioFrame.from_ndarray(
-                        np.ascontiguousarray(samples), format="dblp", layout=layout
-                    )
-                    frame.sample_rate = sample_rate
-                    frame.time_base = Fraction(1, sample_rate)
-                    frame.pts = start
-                    container.mux(stream.encode(frame))
-                container.mux(stream.encode(None))
-            if clipped_samples:
-                clipped_paths.add(temporary_path)
+                peak = max(peak, float(np.abs(samples).max()))
+                over_range_samples += int(np.count_nonzero((samples < -1.0) | (samples > 1.0)))
+
+            variants = [("original", 1.0)]
+            if over_range_samples:
+                variants = [("clipped", 1.0), ("gain-reduced", target_peak / peak)]
                 logger.warning(
-                    "DX2UploadMediaToS3: audio track %d clamped to [-1, 1]; "
-                    "original peak=%s, clipped samples=%d/%d; filename marked -clipped",
-                    batch_index + 1, peak, clipped_samples, track.numel(),
+                    "DX2UploadMediaToS3: audio track %d producing -clipped and -gain-reduced; "
+                    "original peak=%s, clipped samples=%d/%d; reduced gain=%s, target=%s dBFS",
+                    batch_index + 1, peak, over_range_samples, track.numel(),
+                    target_peak / peak, target_peak_dbfs,
                 )
-            resolved_paths.append(temporary_path)
-        return resolved_paths, clipped_paths
+
+            for variant, gain in variants:
+                descriptor, temporary_path = tempfile.mkstemp(suffix=".flac")
+                os.close(descriptor)
+                temporary_paths.append(temporary_path)
+                with av.open(temporary_path, mode="w", format="flac") as container:
+                    for key, value in (metadata or {}).items():
+                        container.metadata[key] = json.dumps(value)
+                    stream = container.add_stream("flac", rate=sample_rate)
+                    stream.layout = layout
+                    stream.format = "s32"
+                    stream.codec_context.options = {"bits_per_raw_sample": "24"}
+                    for start, original_samples in chunks():
+                        # Both variants come directly from the original. Never
+                        # modify NumPy views of the source tensor in place.
+                        if variant == "clipped":
+                            samples = np.clip(original_samples, -1.0, 1.0)
+                        elif variant == "gain-reduced":
+                            samples = original_samples * gain
+                        else:
+                            samples = original_samples
+                        frame = av.AudioFrame.from_ndarray(
+                            np.ascontiguousarray(samples), format="dblp", layout=layout
+                        )
+                        frame.sample_rate = sample_rate
+                        frame.time_base = Fraction(1, sample_rate)
+                        frame.pts = start
+                        container.mux(stream.encode(frame))
+                    container.mux(stream.encode(None))
+                resolved_paths.append(temporary_path)
+                audio_details[temporary_path] = {
+                    "batch_index": batch_index,
+                    "batch_count": waveform.shape[0],
+                    "processing": {
+                        "variant": variant,
+                        "original_peak": peak,
+                        "original_out_of_range_samples": over_range_samples,
+                        "sample_count": track.numel(),
+                        "gain": gain,
+                        "gain_db": 20 * math.log10(gain),
+                        "target_peak_dbfs": target_peak_dbfs if variant == "gain-reduced" else None,
+                        "clipped_samples": over_range_samples if variant == "clipped" else 0,
+                    },
+                }
+        return resolved_paths, audio_details
 
     @staticmethod
     def _build_sidecar_key(media_s3_key: str) -> str:
@@ -540,6 +575,7 @@ class DX2UploadMediaToS3:
         prompt,
         extra_pnginfo,
         temporary_paths,
+        audio_processing=None,
     ) -> str:
         """Write a versioned workflow-provenance envelope to a temp file."""
         metadata = extra_pnginfo if isinstance(extra_pnginfo, dict) else {}
@@ -562,6 +598,9 @@ class DX2UploadMediaToS3:
                 "extra_pnginfo": remaining_metadata,
             },
         }
+
+        if audio_processing is not None:
+            envelope["media"]["audio_processing"] = audio_processing
 
         file_descriptor, temporary_path = tempfile.mkstemp(
             suffix=".workflow.json"
