@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Embed ComfyUI prompt, supplied editable workflow, and compatible extra fields
+  in native PNG, MP4, and FLAC outputs during their existing serialization step.
+  Added a default-on `embed_metadata` input without shifting existing inputs;
+  respects ComfyUI's `--disable-metadata` independently of sidecar uploads.
+  Existing local/VHS files retain their original bytes. Invalid embedded fields
+  are logged and skipped. Added metadata readback and media-preservation tests.
 - Added an optional native `AUDIO` input for mono/stereo batches, encoded as
   24-bit FLAC with PyAV at the source sample rate. Existing input positions and
   the single-URI return contract are preserved.

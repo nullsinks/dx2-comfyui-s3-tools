@@ -289,12 +289,14 @@ def test_audio_does_not_shift_existing_interface():
     optional = DX2UploadMediaToS3.INPUT_TYPES()["optional"]
     assert list(optional) == [
         "image", "video", "local_path", "vhs_filenames", "s3_path", "file_name",
-        "enabled", "upload_workflow", "audio",
+        "enabled", "upload_workflow", "audio", "embed_metadata",
     ]
     assert optional["audio"] == ("AUDIO",)
+    assert optional["embed_metadata"] == ("BOOLEAN", {"default": True})
     assert list(inspect.signature(DX2UploadMediaToS3.upload_media).parameters) == [
         "self", "local_path", "vhs_filenames", "s3_path", "file_name", "enabled",
         "upload_workflow", "video", "image", "prompt", "extra_pnginfo", "audio",
+        "embed_metadata",
     ]
     assert DX2UploadMediaToS3.RETURN_TYPES == ("STRING",)
 

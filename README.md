@@ -23,6 +23,7 @@ VideoHelperSuite output to an S3-compatible bucket.
 | `enabled` | BOOLEAN | No | Set to `false` to skip uploading and return `"upload_skipped"` (default: `true`). |
 | `upload_workflow` | BOOLEAN | No | Upload a JSON workflow-provenance sidecar under the destination's `workflows/` folder (default: `true`). |
 | `audio` | AUDIO | No | Decoded ComfyUI audio, including MiniMax Music 3 and YuE2 workflows. Each mono/stereo track in the batch is uploaded as 24-bit FLAC. |
+| `embed_metadata` | BOOLEAN | No | Embed prompt/workflow metadata in native PNG, MP4, and FLAC files (default: `true`). Independent of `upload_workflow`; respects ComfyUI's `--disable-metadata`. |
 
 At least one media source must be connected. When multiple sources are
 provided, priority is `image`, then `video`, then `audio`, then `local_path`, then
@@ -64,6 +65,50 @@ s3://my-bucket/media/test-20260816T193012_123456Z.mp4
 s3://my-bucket/image/ComfyUI-20260816T193012_123456Z.png
 ```
 
+#### Embedded workflow metadata
+
+Native IMAGE, VIDEO, and AUDIO uploads embed provenance in the media file by
+default, so it travels with the downloaded file:
+
+| Output | Storage |
+|---|---|
+| PNG | PNG text chunks written with Pillow, using ComfyUI's `prompt` and `workflow` keys. |
+| FLAC | Vorbis comment fields written during the existing PyAV encode. |
+| MP4 | Container tags written by ComfyUI's native `VIDEO.save_to(..., metadata=...)`. |
+
+`prompt` contains the executed API graph; `workflow` contains the editable UI
+graph when supplied in `EXTRA_PNGINFO`. API callers that only send an execution
+graph get `prompt` without an invented `workflow`. Other JSON-compatible extra
+fields are included. The executed prompt takes precedence over an extra field
+named `prompt`. Invalid fields are skipped with a warning, retaining valid fields.
+Portable tag names must be 1–79 printable ASCII characters, excluding `=`, with
+no leading, trailing, or consecutive spaces.
+
+Embedding uses the existing encoding step and does not change image pixels,
+audio precision, sample rate, or video encoding settings. There is no second
+encoding pass. Existing `local_path` and VHS files are uploaded byte-for-byte,
+including whatever metadata their original saver wrote.
+
+Set `embed_metadata=false` or start ComfyUI with `--disable-metadata` to stop
+adding embedded fields. These settings do not strip pre-existing metadata or
+disable sidecars: `upload_workflow` controls sidecars separately. To disable both
+forms of new provenance, set both node options to `false`.
+
+Embedded metadata and S3 object headers are separate. The S3 console's metadata
+panel will show `ContentType`, not these in-file fields. After downloading a
+newly generated file, read the fields back, for example:
+
+```bash
+ffprobe -v error -show_entries format_tags=prompt,workflow -of json downloaded.flac
+ffprobe -v error -show_entries format_tags=prompt,workflow -of json downloaded.mp4
+python -c "from PIL import Image; import json; im = Image.open('downloaded.png'); print({k: json.loads(im.info[k]) for k in ('prompt', 'workflow') if k in im.info})"
+```
+
+Confirm the graph and generation parameters match the submitted workflow.
+Editors can remove metadata when exporting, and automatic workflow import
+depends on the ComfyUI frontend's support for the file type. Keep the sidecar
+as a separate provenance copy.
+
 #### Workflow provenance sidecars
 
 When `upload_workflow` is `true`, each media object receives a same-stem
@@ -90,7 +135,7 @@ but a successful media upload still returns its media URI. Set
 > [!WARNING]
 > Workflow metadata can contain prompts, local paths, model names, and values
 > entered into third-party node widgets. Review workflows for credentials or
-> other sensitive values before storing sidecars in a shared bucket.
+> other sensitive values before sharing media with embedded metadata or sidecars.
 
 #### S3 content types
 
@@ -107,7 +152,8 @@ in `file_name`. Compressed files with an inferred content encoding fall back to
 `application/octet-stream` rather than advertising the uncompressed inner type.
 
 This applies to new uploads only. Previously uploaded objects are not updated.
-It does not add embedded workflow metadata, custom S3 metadata, or download headers.
+`ContentType` is independent of embedded provenance. The uploader does not add
+custom S3 metadata or download headers.
 
 ## Installation
 
@@ -263,6 +309,7 @@ workflows may omit `upload_workflow` and inherit `true`; set it explicitly to
 | Missing credentials | Raises `EnvironmentError` naming the missing configuration. |
 | Media upload failure | Raises `RuntimeError` with `s3://bucket/key` context. |
 | Workflow sidecar failure | Logs a warning and returns the successful media URI. |
+| Non-JSON embedded field or unsupported tag name | Logs a warning and skips that field, retaining other valid fields. |
 | `enabled` is `false` | Returns `"upload_skipped"` without side effects. |
 
 If an image/audio batch fails partway through, already-uploaded objects remain in S3;
@@ -283,7 +330,17 @@ libsndfile decoding through SoundFile. They verify 24-bit precision, sample rate
 channel order, frame count, quantization error, and input immutability. S3 calls
 are mocked; content-type arguments, naming, sidecars, and failure cleanup are tested.
 
+Metadata tests read prompt/workflow fields back from real PNG and FLAC upload
+bytes and compare decoded media with embedding on/off. MP4 integration tests
+exercise ComfyUI's actual tensor-backed saver and file-backed remuxer, including
+8-bit/10-bit video with audio and identical encoded packets with embedding
+on/off. Those four tests run when ComfyUI is available on `PYTHONPATH`; otherwise
+they are explicitly skipped. Unit tests still verify the VIDEO metadata call.
+
 Before declaring live compatibility, load an existing UI workflow and check its
 connections, run a short MiniMax Music 3 and YuE2 generation through the uploader,
 inspect the uploaded objects' `ContentType`, then download and import a FLAC into
 Audacity. These checks require the target ComfyUI environment and S3 access.
+Also download newly uploaded PNG/MP4/FLAC files and inspect their embedded
+`prompt` and supplied `workflow` fields using the commands above. Test workflow
+import in the deployed frontend separately from metadata readback.

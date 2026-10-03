@@ -78,6 +78,7 @@ class DX2UploadMediaToS3:
                 "upload_workflow": ("BOOLEAN", {"default": True}),
                 # Append new inputs to preserve existing workflow socket indices.
                 "audio": ("AUDIO",),
+                "embed_metadata": ("BOOLEAN", {"default": True}),
             },
             "hidden": {
                 "prompt": "PROMPT",
@@ -108,6 +109,7 @@ class DX2UploadMediaToS3:
         prompt=None,
         extra_pnginfo=None,
         audio=None,
+        embed_metadata: bool = True,
     ):
         """Upload media to S3 and return destination information.
 
@@ -140,6 +142,10 @@ class DX2UploadMediaToS3:
             Native ComfyUI AUDIO payload. Each mono/stereo batch item is
             serialized to a temporary 24-bit FLAC at its original sample rate.
             Out-of-range samples are clamped; affected filenames end in -clipped.
+        embed_metadata:
+            Embed prompt and supplied workflow metadata in native PNG, MP4,
+            and FLAC outputs, unless ComfyUI disables metadata globally.
+            Independent of sidecar uploads; existing local/VHS files are unchanged.
         """
         if not enabled:
             logger.info("DX2UploadMediaToS3: upload disabled – skipping.")
@@ -153,19 +159,28 @@ class DX2UploadMediaToS3:
             is_image_upload = image is not None
             forced_suffix = None
             clipped_audio_paths = set()
+            metadata = {}
+            if embed_metadata and (is_image_upload or video is not None or audio is not None):
+                metadata = self._build_embedded_metadata(prompt, extra_pnginfo)
             if is_image_upload:
-                resolved_paths = self._materialize_images(image, temporary_paths)
+                resolved_paths = self._materialize_images(image, temporary_paths, metadata)
                 resolved_path = resolved_paths[0]
                 forced_suffix = ".png"
             elif video is not None:
                 file_descriptor, temporary_path = tempfile.mkstemp(suffix=".mp4")
                 os.close(file_descriptor)
                 temporary_paths.append(temporary_path)
-                video.save_to(temporary_path)
+                if metadata:
+                    # ComfyUI's VIDEO saver serializes structured values itself.
+                    video.save_to(temporary_path, metadata=metadata)
+                else:
+                    video.save_to(temporary_path)
                 resolved_path = temporary_path
                 resolved_paths = [resolved_path]
             elif audio is not None:
-                resolved_paths, clipped_audio_paths = self._materialize_audio(audio, temporary_paths)
+                resolved_paths, clipped_audio_paths = self._materialize_audio(
+                    audio, temporary_paths, metadata
+                )
                 forced_suffix = ".flac"
             else:
                 resolved_path = self._resolve_path(local_path, vhs_filenames)
@@ -318,7 +333,43 @@ class DX2UploadMediaToS3:
         )
 
     @staticmethod
-    def _materialize_images(image, temporary_paths) -> list[str]:
+    def _build_embedded_metadata(prompt, extra_pnginfo) -> dict:
+        """Capture JSON values once; individual serializers choose tag encoding."""
+        try:
+            from comfy.cli_args import args
+        except ModuleNotFoundError as exc:
+            # Allow standalone use and tests without importing the ComfyUI runtime.
+            if exc.name not in {"comfy", "comfy.cli_args"}:
+                raise
+        else:
+            if args.disable_metadata:
+                return {}
+
+        supplied = dict(extra_pnginfo) if isinstance(extra_pnginfo, dict) else {}
+        if prompt is not None:
+            supplied["prompt"] = prompt
+        metadata = {}
+        for key, value in supplied.items():
+            # Use keys valid in both PNG keywords and FLAC Vorbis comments.
+            if (
+                not isinstance(key, str)
+                or not 1 <= len(key) <= 79
+                or key != key.strip()
+                or "  " in key
+                or any(not 32 <= ord(char) <= 126 or char == "=" for char in key)
+            ):
+                logger.warning("DX2UploadMediaToS3: skipping invalid embedded metadata key.")
+                continue
+            try:
+                metadata[key] = json.loads(json.dumps(value, allow_nan=False))
+            except (TypeError, ValueError, RecursionError):
+                logger.warning(
+                    "DX2UploadMediaToS3: skipping non-JSON embedded metadata field %s.", key
+                )
+        return metadata
+
+    @staticmethod
+    def _materialize_images(image, temporary_paths, metadata=None) -> list[str]:
         """Serialize every IMAGE batch item to a temporary PNG file."""
         try:
             shape = tuple(image.shape)
@@ -343,6 +394,11 @@ class DX2UploadMediaToS3:
         # lazily so path and video uploads do not add an import-time dependency.
         import numpy as np
         from PIL import Image
+        from PIL.PngImagePlugin import PngInfo
+
+        pnginfo = PngInfo()
+        for key, value in (metadata or {}).items():
+            pnginfo.add_text(key, json.dumps(value))
 
         resolved_paths = []
         for image_tensor in image:
@@ -356,13 +412,13 @@ class DX2UploadMediaToS3:
             image_array = np.clip(255.0 * image_array, 0, 255).astype(np.uint8)
             if shape[-1] == 1:
                 image_array = image_array[..., 0]
-            Image.fromarray(image_array).save(temporary_path, format="PNG")
+            Image.fromarray(image_array).save(temporary_path, format="PNG", pnginfo=pnginfo)
             resolved_paths.append(temporary_path)
 
         return resolved_paths
 
     @staticmethod
-    def _materialize_audio(audio, temporary_paths) -> tuple[list[str], set[str]]:
+    def _materialize_audio(audio, temporary_paths, metadata=None) -> tuple[list[str], set[str]]:
         """Encode AUDIO as 24-bit FLAC; report paths with clamped finite samples."""
         if not isinstance(audio, dict) or not {"waveform", "sample_rate"} <= audio.keys():
             raise ValueError(
@@ -420,6 +476,8 @@ class DX2UploadMediaToS3:
             os.close(descriptor)
             temporary_paths.append(temporary_path)
             with av.open(temporary_path, mode="w", format="flac") as container:
+                for key, value in (metadata or {}).items():
+                    container.metadata[key] = json.dumps(value)
                 stream = container.add_stream("flac", rate=sample_rate)
                 stream.layout = layout
                 # FLAC uses s32 frames for 24-bit samples. Explicit precision
